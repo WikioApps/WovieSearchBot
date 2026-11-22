@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly Wovie offsite snapshot
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=120
+Persistent=true
+Unit=wovie-snapshot.service
+
+[Install]
+WantedBy=timers.target

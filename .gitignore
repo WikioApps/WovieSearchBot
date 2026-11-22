@@ -1,0 +1,27 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.session
+*.session-journal
+*.log
+*.encrypted
+*.bson
+*.sqlite*
+*.zip
+backups/
+build/
+dist/
+*.egg-info/
+.DS_Store
+# Research archive remains in the workspace, outside production.
+docs/research/
+
+*.env
+profiles/
+*.wbak
+*.wbak.sha256
+archives/

@@ -1,0 +1,57 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wovie · Catalog</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style nonce="__NONCE__">
+:root{color-scheme:dark;font:16px/1.45 system-ui,sans-serif;color:#f6f2ea;background:#111719}
+*{box-sizing:border-box}body{margin:0}main{max-width:720px;margin:auto;padding:22px 18px 44px}
+header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #3c4446;padding-bottom:12px}
+strong{font:700 20px Georgia,serif}h1{font:500 clamp(37px,8vw,60px)/1.15 Georgia,serif;margin:28px 0 18px}form{display:flex;gap:8px}
+input,button,a{font:inherit}input{min-width:0;flex:1;background:#20272b;border:1px solid #687276;color:#fff;border-radius:8px;padding:11px}
+button,a{border:0;background:#ecbd85;color:#232323;border-radius:7px;padding:9px 14px;cursor:pointer;text-decoration:none}
+button:disabled{opacity:.5;cursor:default}button.secondary{background:#293438;color:#f6f2ea}label{display:block;margin-bottom:6px}
+p{margin:10px 0;color:#c6d2d0}#list{list-style:none;padding:0}li{padding:16px 0;border-top:1px solid #364043}h2{margin:0;font-size:18px}
+small{display:block;color:#b4c1bd;overflow-wrap:anywhere;margin:4px 0 8px}
+.actions,nav{display:flex;gap:6px;flex-wrap:wrap}video{width:100%;margin:12px 0;background:#000}
+details{border-top:1px solid #384245;margin-top:20px;padding:12px 0}summary{cursor:pointer}#upload{flex-wrap:wrap;align-items:end;margin:12px 0}
+select,#file{display:block;max-width:100%;margin-top:3px}#trash li{display:flex;align-items:center;justify-content:space-between;gap:8px}
+[hidden]{display:none!important}
+</style></head><body><main><header><strong id="brand">Wovie</strong><span>Media catalog</span></header>
+<h1>Find a release</h1><label for="query">Title or filename</label><form id="search"><input id="query" maxlength="300" required autocomplete="off" placeholder="Title, year, language…"><button id="go" disabled>Search</button></form>
+<p><small>Try <b>Arrival year:2016 quality:1080p</b> or a series title with <b>S01E02</b>.</small></p>
+<p id="status" role="status">Opening Telegram session…</p><video id="player" controls playsinline hidden></video><nav id="media"></nav><ul id="list"></ul><nav><button hidden class="secondary" id="prev">Previous</button><button hidden class="secondary" id="next">Next</button><button hidden class="secondary" id="stats">Admin status</button></nav><details id="adminPanel" hidden><summary>Catalog administration</summary>
+<form id="upload" hidden><label>Destination<select id="target"></select></label><label>File<input id="file" type="file" required></label><button>Upload &amp; index</button></form>
+<button id="recycle" class="secondary">Show hidden entries</button><ul id="trash"></ul></details></main>
+<script nonce="__NONCE__">
+"use strict";
+const tg=window.Telegram?.WebApp, el=id=>document.getElementById(id);
+let page=0,term="",admin=false,stream=false,busy=false,uploadKey="",uploadLimit=0;
+async function api(path,data={}){
+ const response=await fetch("/api/"+path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),credentials:"same-origin"});
+ const body=await response.json();if(!response.ok)throw Error(body.error||"Request failed.");return body;
+}
+const show=message=>el("status").textContent=message;
+function action(row,label,handler){const b=document.createElement("button");b.textContent=label;b.className="secondary";b.onclick=async()=>{b.disabled=true;try{await handler()}catch(e){show(e.message)}finally{b.disabled=false}};row.append(b)}
+async function results(n){
+ if(busy)return;busy=true;el("go").disabled=true;show("Searching…");
+ try{const data=await api("search",{q:term,page:n});page=n;el("list").replaceChildren();for(const f of data.files){
+ const li=document.createElement("li"),h=document.createElement("h2"),meta=document.createElement("small"),row=document.createElement("div");
+ h.textContent=f.title;meta.textContent=[f.filename,f.size?Math.ceil(f.size/1048576)+" MiB":"",f.quality].filter(Boolean).join(" · ");row.className="actions";
+ action(row,"Get in Telegram",async()=>{const x=await api("link",{id:f.id});tg.openTelegramLink(x.url)});
+ if(stream)action(row,"Play or save",async()=>{const x=await api("ticket",{id:f.id});const dl=document.createElement("a");dl.textContent="Download file";dl.href=x.url+"?download=1";dl.download="";el("media").replaceChildren(dl);el("player").src=x.url;el("player").hidden=false;el("player").scrollIntoView({block:"center"})});
+ if(admin)action(row,"Hide",async()=>{if(confirm("Hide this catalog entry? You can restore it from Catalog administration.")){await api("hide",{id:f.id,confirm:f.id});await results(page)}});
+ li.append(h,meta,row);el("list").append(li)}
+ el("prev").hidden=!n;el("next").hidden=!data.more;show(data.files.length?"Page "+(n+1):"No matching files in your available sources.");
+ }catch(e){show(e.message)}finally{busy=false;el("go").disabled=false}
+}
+el("prev").onclick=()=>results(page-1);el("next").onclick=()=>results(page+1);
+el("search").onsubmit=event=>{event.preventDefault();term=el("query").value.trim();if(term)results(0)};
+el("recycle").onclick=async()=>{try{const d=await api("hidden");el("trash").replaceChildren();for(const f of d.files){
+ const li=document.createElement("li"),name=document.createElement("span");name.textContent=f.name;li.append(name);action(li,"Restore",async()=>{await api("restore",{id:f.id,confirm:f.id});li.remove();show("Entry restored.")});el("trash").append(li)}show(d.files.length?"Recently hidden entries":"No entries hidden through this catalog.");}catch(e){show(e.message)}};
+el("file").onchange=el("target").onchange=()=>uploadKey="";
+el("upload").onsubmit=async e=>{e.preventDefault();const file=el("file").files[0],source=el("target").value,submit=e.submitter;
+ if(!file||!source||file.size>uploadLimit){show("Choose a file within the displayed limit.");return}if(!confirm("Post this file to source "+source+" and index it?"))return;
+ submit.disabled=true;uploadKey ||= crypto.randomUUID();try{show("Uploading to the selected source…");const body=new FormData();body.append("file",file);
+ const r=await fetch("/admin/upload/"+encodeURIComponent(source),{method:"POST",headers:{"X-Upload-ID":uploadKey},body,credentials:"same-origin"});const d=await r.json();
+ if(!r.ok)throw Error(d.error||"Upload failed.");show("Indexed file "+d.id);el("file").value="";uploadKey=""}catch(err){show(err.message)}finally{submit.disabled=false}};
+el("stats").onclick=async()=>{try{show(JSON.stringify((await api("stats")).stats))}catch(e){show(e.message)}};
+(async()=>{try{if(!tg?.initData)throw Error("Open the catalog from /app in your private chat with the bot.");tg.ready();const d=await api("login",{init_data:tg.initData});admin=d.admin;stream=d.stream;el("brand").textContent=d.brand;el("stats").hidden=!admin;el("adminPanel").hidden=!admin;uploadLimit=d.upload_limit||0;for(const id of d.sources||[]){const o=document.createElement("option");o.value=id;o.textContent=id;el("target").append(o)}el("upload").hidden=!admin||!uploadLimit||!el("target").options.length;if(uploadLimit)el("upload").querySelector("button").textContent="Upload (max "+Math.ceil(uploadLimit/1048576)+" MiB)";el("go").disabled=false;show("Ready to search.");}catch(e){show(e.message)}})();
+</script></body></html>
