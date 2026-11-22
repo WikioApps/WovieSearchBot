@@ -1,0 +1,16 @@
+{
+  "name": "Wovie Auto Filter",
+  "description": "Telegram media search with forward indexing and live MongoDB settings.",
+  "repository": "https://github.com/WikioApps/WovieSearchBot",
+  "keywords": ["telegram", "auto-filter", "mongodb", "python"],
+  "stack": "heroku-24",
+  "buildpacks": [{"url": "heroku/python"}],
+  "formation": {"web": {"quantity": 1, "size": "basic"}},
+  "env": {
+    "API_ID": {"description": "Telegram API ID from my.telegram.org/apps"},
+    "API_HASH": {"description": "Matching Telegram API hash"},
+    "BOT_TOKEN": {"description": "BotFather token"},
+    "OWNER_ID": {"description": "Your numeric Telegram user ID"},
+    "DATABASE_URI": {"description": "MongoDB URI with database name, or JSON list with primary first"}
+  }
+}

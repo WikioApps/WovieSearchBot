@@ -1,24 +1,8 @@
 services:
   bot:
     build: .
+    env_file: .env
     restart: unless-stopped
     init: true
-    env_file: .env
-    read_only: true
-    volumes:
-      - work:/var/lib/wovie
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    mem_limit: 192m
-    pids_limit: 64
-    stop_grace_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: 5m
-        max-file: "2"
-
-volumes:
-  work:
+    ports:
+      - "127.0.0.1:8080:8080"

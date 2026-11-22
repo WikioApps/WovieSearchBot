@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: wovie-search-bot
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    numInstances: 1
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: DATABASE_URI
+        sync: false
