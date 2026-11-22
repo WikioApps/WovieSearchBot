@@ -9,10 +9,11 @@ from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
 from uuid import uuid4
 
-from pymongo import AsyncMongoClient
+from pymongo import AsyncMongoClient, ReplaceOne, UpdateOne
 from pymongo.write_concern import WriteConcern
 
 from info import DEFAULTS, LANGUAGES, PERSONAL
+from Script import release
 
 
 def now():
@@ -75,6 +76,10 @@ def file_doc(m):
         return None
     caption = str(m.caption or "").splitlines()
     name = media.file_name or (caption[0][:180] if caption else None) or f"Media {m.id}"
+    if release(name) == "Media file" and caption:
+        name = next(
+            (line[:180] for line in caption if release(line) != "Media file"), name
+        )
     content = " ".join([name, *caption])[:2000]
     tokens = list(dict.fromkeys(words(content)))[:160]
     d = tags(content)
@@ -93,6 +98,21 @@ def file_doc(m):
         }
     )
     return d
+
+
+def edition_fields(doc):
+    fields = {
+        k: doc[k]
+        for k in ("name", "bytes", "language", "quality", "year", "season", "episode")
+    }
+    fields["unique"] = doc.get("unique")
+    if release(fields["name"]) == "Media file":
+        label = " ".join(
+            w for w in doc.get("tokens", []) if w not in {"mkv", "mp4", "avi", "webm"}
+        )
+        if label:
+            fields["name"] = label[:180]
+    return fields
 
 
 def parse_query(query):
@@ -140,6 +160,7 @@ class Store:
         ]
         self.db = self.dbs[0]
         self.shards = {}
+        self.catalog_lock = asyncio.Lock()
         self.state = self.db.eva_settings
         self.jobs = self.db.eva_jobs
         self.users = self.db.eva_users
@@ -161,11 +182,10 @@ class Store:
             sid = ident["uuid"]
             if sid in self.shards:
                 raise ValueError("DATABASE_URI contains the same database twice.")
-            self.shards[sid] = db.eva_files
-            await db.eva_files.create_index(
-                [("source", 1), ("tokens", 1), ("time", -1)]
-            )
-            await db.eva_files.create_index([("source", 1), ("prefix", 1)])
+            self.shards[sid] = db.eva_media
+            await db.eva_media.create_index("tokens")
+            await db.eva_media.create_index("prefix")
+            await db.eva_posts.create_index([("media", 1), ("source", 1), ("time", -1)])
         registered = await self.db.eva_meta.find_one({"_id": "shards"})
         if registered and not set(registered["ids"]).issubset(self.shards):
             raise ValueError(
@@ -198,8 +218,10 @@ class Store:
             self.db.eva_grants,
             self.db.eva_metadata,
             self.db.eva_trending,
+            self.db.eva_status,
         ):
             await coll.create_index("expires", expireAfterSeconds=0)
+        await self.users.create_index("last_seen")
         await self.deletions.create_index("due")
         await self.jobs.create_index([("status", 1), ("created", 1)])
         await self.saved.create_index([("user", 1), ("time", -1)])
@@ -210,7 +232,10 @@ class Store:
 
     async def config(self, uid=None):
         d = await self.state.find_one({"_id": uid if uid is not None else "bot"}) or {}
-        return (PERSONAL if uid is not None else DEFAULTS) | d.get("values", {})
+        defaults = PERSONAL if uid is not None else DEFAULTS
+        return defaults | {
+            k: v for k, v in d.get("values", {}).items() if k in defaults
+        }
 
     async def setting(self, key, value, uid=None, reset=False):
         await self.state.update_one(
@@ -238,26 +263,196 @@ class Store:
             upsert=True,
         )
 
-    async def collection(self, source):
-        preferred = max(
-            self.shards,
-            key=lambda sid: hashlib.sha256(f"{source}:{sid}".encode()).digest(),
+    async def upgrade_audience(self):
+        marker = {"_id": "audience-v2"}
+        if await self.db.eva_meta.find_one(marker):
+            return
+        # Before this version "seen" on a positive ID meant a private conversation.
+        await self.users.update_many(
+            {
+                "_id": {"$gt": 0},
+                "seen": {"$exists": True},
+                "last_seen": {"$exists": False},
+            },
+            [{"$set": {"dm": True, "last_seen": "$seen"}}],
         )
-        row = await self.db.eva_routes.find_one_and_update(
-            {"_id": source},
-            {"$setOnInsert": {"shard": preferred}},
-            upsert=True,
-            return_document=True,
+        await self.db.eva_meta.update_one(
+            marker, {"$set": {"complete": True}}, upsert=True
         )
-        return self.shards[row["shard"]]
+
+    async def upgrade_catalog(self):
+        # Finish interrupted edits before accepting new updates. Source rows from
+        # older releases stay in place and are imported once per database.
+        await self.recover_writes()
+        for db in self.dbs:
+            marker = await db.eva_meta.find_one({"_id": "distinct-v1"}) or {}
+            while not marker.get("complete"):
+                rows = (
+                    await db.eva_files.find({"_id": {"$gt": marker.get("cursor", "")}})
+                    .sort("_id", 1)
+                    .limit(100)
+                    .to_list(100)
+                )
+                if rows:
+                    await self.catalog_write(rows, stamp="upgrade")
+                    marker = {"cursor": rows[-1]["_id"]}
+                else:
+                    marker = {"complete": True}
+                await db.eva_meta.update_one(
+                    {"_id": "distinct-v1"}, {"$set": marker}, upsert=True
+                )
+
+    async def recover_writes(self):
+        async for pending in self.db.eva_writes.find().sort("_id", 1):
+            await self._apply(pending)
+            await self.db.eva_writes.delete_one({"_id": pending["_id"]})
+        for coll in self.shards.values():
+            # A journal replay can finish a deletion after its location was already removed.
+            # Only inspect media marked for cleanup instead of scanning the catalog.
+            async for row in coll.database.eva_gc.find():
+                await self.prune(coll, row["_id"])
+
+    async def catalog_write(self, docs=(), removed=(), stamp=None):
+        if not docs and not removed:
+            return 0
+        op = {
+            "docs": list(docs),
+            "removed": list(removed),
+            "stamp": stamp or uuid4().hex,
+        }
+        async with self.catalog_lock:
+            # Standalone Mongo and separate clusters cannot share a transaction.
+            # Journal the complete change so a restart can finish all writes.
+            if await self.db.eva_writes.find_one({}, {"_id": 1}):
+                await self.recover_writes()
+            await self.db.eva_writes.insert_one(op)
+            result = await self._apply(op)
+            await self.db.eva_writes.delete_one({"_id": op["_id"]})
+            return result
+
+    async def _apply(self, op):
+        by_id = {}
+        for doc in op["docs"]:
+            identity = doc.get("unique") or "post:" + doc["_id"]
+            by_id.setdefault(identity, []).append(doc)
+        routes = self.db.eva_media_routes
+        if by_id:
+            await routes.bulk_write(
+                [
+                    UpdateOne(
+                        {"_id": ident},
+                        {
+                            "$setOnInsert": {
+                                "shard": max(
+                                    self.shards,
+                                    key=lambda sid: hashlib.sha256(
+                                        f"{ident}:{sid}".encode()
+                                    ).digest(),
+                                )
+                            }
+                        },
+                        upsert=True,
+                    )
+                    for ident in by_id
+                ],
+                ordered=False,
+            )
+        placement = {
+            r["_id"]: r["shard"]
+            async for r in routes.find({"_id": {"$in": list(by_id)}})
+        }
+        keys = [d["_id"] for d in op["docs"]] + op["removed"]
+        created = 0
+        for sid, media in self.shards.items():
+            posts = media.database.eva_posts
+            local = {i: rows for i, rows in by_id.items() if placement[i] == sid}
+            keep = {d["_id"] for rows in local.values() for d in rows}
+            old = {
+                p["media"]
+                async for p in posts.find({"_id": {"$in": keys}}, {"media": 1})
+            }
+            obsolete = old - set(local)
+            if obsolete:
+                await media.database.eva_gc.bulk_write(
+                    [
+                        UpdateOne({"_id": i}, {"$setOnInsert": {"_id": i}}, upsert=True)
+                        for i in obsolete
+                    ],
+                    ordered=False,
+                )
+            if local:
+                items = []
+                locations = []
+                for ident, rows in local.items():
+                    first = rows[0]
+                    fields = edition_fields(first)
+                    items.append(
+                        UpdateOne(
+                            {"_id": ident},
+                            {
+                                "$setOnInsert": dict(
+                                    fields, ingest=op["stamp"], origin=first["_id"]
+                                ),
+                                "$addToSet": {
+                                    k: {"$each": list({t for d in rows for t in d[k]})}
+                                    for k in ("tokens", "prefix")
+                                },
+                            },
+                            upsert=True,
+                        )
+                    )
+                    for d in rows:
+                        # The first source supplies the display metadata. A repost
+                        # can add search terms without renaming the original edition.
+                        items.append(
+                            UpdateOne(
+                                {"_id": ident, "origin": d["_id"]},
+                                {"$set": edition_fields(d)},
+                            )
+                        )
+                        post = {k: d[k] for k in ("_id", "source", "mid", "time")}
+                        locations.append(
+                            ReplaceOne(
+                                {"_id": d["_id"]}, dict(post, media=ident), upsert=True
+                            )
+                        )
+                await media.bulk_write(items, ordered=True)
+                await posts.bulk_write(locations, ordered=False)
+                created += await media.count_documents(
+                    {"_id": {"$in": list(local)}, "ingest": op["stamp"]}
+                )
+            stale = set(keys) - keep
+            if stale:
+                await posts.delete_many({"_id": {"$in": list(stale)}})
+            for ident in obsolete:
+                await self.prune(media, ident)
+        return created
+
+    async def prune(self, media, ident):
+        if not await media.database.eva_posts.find_one({"media": ident}, {"_id": 1}):
+            await media.delete_one({"_id": ident})
+        await media.database.eva_gc.delete_one({"_id": ident})
 
     async def file(self, key):
         if not re.fullmatch(r"[0-9a-f]{1,15}_[0-9a-f]{1,8}", key):
             return None
-        source = -int(key.split("_")[0], 16)
-        route = await self.db.eva_routes.find_one({"_id": source})
+        for coll in self.shards.values():
+            post = await coll.database.eva_posts.find_one({"_id": key})
+            if post:
+                media = await coll.find_one({"_id": post["media"]})
+                if media:
+                    return media | post
+        return None
+
+    async def alternatives(self, doc, sources):
+        ident = doc["media"]
+        route = await self.db.eva_media_routes.find_one({"_id": ident})
         if route:
-            return await self.shards[route["shard"]].find_one({"_id": key})
+            posts = self.shards[route["shard"]].database.eva_posts
+            async for row in posts.find(
+                {"media": ident, "_id": {"$ne": doc["_id"]}, "source": {"$in": sources}}
+            ).sort("time", -1):
+                yield row
 
     async def search(
         self, query, filters, sources, sort="newest", suggest=False, limit=101
@@ -265,7 +460,6 @@ class Store:
         tokens, facets = parse_query(query)
         facets.update(filters)
         criteria = {
-            "source": {"$in": sources},
             **{k: v for k, v in facets.items() if v and v != "any"},
         }
         if not sources or not (tokens or facets):
@@ -285,13 +479,31 @@ class Store:
             "source": 1,
         }
 
+        loc = {
+            "$lookup": {
+                "from": "eva_posts",
+                "localField": "_id",
+                "foreignField": "media",
+                "pipeline": [
+                    {"$match": {"source": {"$in": sources}}},
+                    {"$sort": {"time": direction, "_id": direction}},
+                    {"$limit": 1},
+                ],
+                "as": "post",
+            }
+        }
+
         async def find(c):
-            return (
-                await c.find(criteria, projection)
-                .sort([("time", direction), ("_id", direction)])
-                .limit(limit)
-                .to_list(limit)
-            )
+            pipeline = [
+                {"$match": criteria},
+                loc,
+                {"$unwind": "$post"},
+                {"$replaceWith": {"$mergeObjects": ["$$ROOT", "$post"]}},
+                {"$sort": {"time": direction, "_id": direction}},
+                {"$limit": limit},
+                {"$project": projection},
+            ]
+            return await (await c.aggregate(pipeline, allowDiskUse=True)).to_list(limit)
 
         groups = await asyncio.gather(*(find(c) for c in self.shards.values()))
         hits = sorted(
@@ -306,9 +518,14 @@ class Store:
             return [], []
         candidates = set()
         for coll in self.shards.values():
-            async for d in coll.find(
-                {"source": {"$in": sources}, "prefix": {"$in": prefix}}, {"name": 1}
-            ).limit(45):
+            pipeline = [
+                {"$match": {"prefix": {"$in": prefix}}},
+                loc,
+                {"$match": {"post.0": {"$exists": True}}},
+                {"$limit": 45},
+                {"$project": {"name": 1}},
+            ]
+            async for d in await coll.aggregate(pipeline):
                 title = re.split(
                     r"\b(?:19\d\d|20\d\d|s\d+e?\d*|1080p|720p|2160p|480p)\b",
                     norm(d["name"]),

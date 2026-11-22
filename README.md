@@ -16,8 +16,8 @@
 | 🗂 Forward indexing | Forward the last source post, confirm the range, watch progress, pause and resume. New source media and edits are indexed as they arrive. |
 | 🔎 Auto filter | Search in private, in groups, or inline. Combine title, year, language, resolution, season and episode. Browse paginated buttons or a compact link list. |
 | 🎞 File cards | See the edition and size, save to a watchlist, get one file or get the visible page. Optional TMDB posters and summaries. |
-| 🛠 Bot settings | Edit the welcome photo and text, buttons, captions, channels, permissions, streaming, file protection and expiry from Telegram. |
-| ⚙ Personal and group settings | Remember each user’s preferred releases and display. Group admins can customize their own group. |
+| 🛠 Bot settings | Edit the welcome photo and text, buttons, captions, channels, permissions, streaming and file protection from Telegram. |
+| ⚙ Personal settings | Remember each user’s preferred releases and display. |
 | 📮 Community | Missing-title requests with moderator replies, trending releases, keyword replies, channel announcements, private and group broadcasts. |
 | 💎 Membership | Grant expiring premium access and optionally reserve browser playback for members. Telegram delivery works with standard membership. |
 | 💾 Storage | One MongoDB is sufficient. Additional databases hold file catalogs. Search results merge across all configured catalogs. |
@@ -30,6 +30,7 @@ Use Python 3.11–3.14 and MongoDB 5.0 or later. Give the database user read/wri
 | --- | --- |
 | `API_ID`, `API_HASH` | The app credentials issued at [my.telegram.org/apps](https://my.telegram.org/apps). |
 | `BOT_TOKEN` | Create a bot with [@BotFather](https://t.me/BotFather). |
+| `LOG_CHANNEL` | Required operations channel. Use its `-100…` ID or public `@username`. Add the bot as an administrator with **Post Messages** permission. |
 | `OWNER_ID` | Your numeric Telegram user ID. This account controls global settings. |
 | `DATABASE_URI` | A MongoDB URI including the database name, e.g. `mongodb+srv://USER:PASSWORD@HOST/wovie`. Percent-encode reserved characters in credentials. |
 
@@ -55,7 +56,7 @@ If the version shown is 3.11–3.14, create the environment and install the depe
   .venv/bin/python -m pip install -r requirements.txt
 ```
 
-After installation succeeds, fill in the five values and save the file. The first command preserves an existing `.env`.
+After installation succeeds, fill in the six values and save the file. The first command preserves an existing `.env`.
 
 ```sh
 test -e .env || cp .env.example .env
@@ -66,14 +67,14 @@ nano .env
 .venv/bin/python bot.py
 ```
 
-Open the bot in private and send `/start`. Set your Updates, Support, Films and Guide URLs in **Bot Settings → Brand & links**. Empty links stay hidden. Your fork can also edit the defaults in [info.py](info.py) and the labels in [Script.py](Script.py). Telegram renders the Unicode small-cap labels, native buttons and bold captions on the user’s device.
+Open the bot in private and send `/start`. Set your Updates, Support, Films and Guide URLs in **Bot Settings → Welcome & links**. Empty links stay hidden. Your fork can also edit the defaults in [info.py](info.py) and the labels in [Script.py](Script.py). Telegram renders the Unicode small-cap labels, native buttons and bold captions on the user’s device.
 
 ## 🗂 𝐈𝐧𝐝𝐞𝐱 𝐚 𝐩𝐫𝐢𝐯𝐚𝐭𝐞 𝐜𝐡𝐚𝐧𝐧𝐞𝐥 𝐨𝐫 𝐠𝐫𝐨𝐮𝐩
 
 1. Add the bot to the source as an **administrator**. Use a source whose files you intend to share with the bot’s audience.
 2. Forward the **last post** in the source to the bot’s private chat. As the owner or a trusted catalog admin, you’ll see the source and exact range. Press **✓ ɪɴᴅᴇx**. The post can be text or media.
 3. If Telegram hides a group forward’s origin, copy the original **message link** and send `/index LINK` instead. Private `t.me/c/…`, topic links and public post links work. You can also reply to the original post **in the group** with `/index`.
-4. Use `/jobs` to check progress, stop or resume. For a specific range, `/index -1001234567890 2400 1000` scans IDs 1001 through 2400 inclusive. The cursor advances after the catalog write. Repeating a range updates the same source posts.
+4. Use `/status` for a live progress bar, post rate, ETA, new files and repeats. Use `/jobs` to stop or resume a job. For a specific range, `/index -1001234567890 2400 1000` scans IDs 1001 through 2400 inclusive. The cursor advances after the catalog write. Repeating a range updates the same source posts.
 
 The default reader uses the bot token. **No user session string is required for a private source the bot can read.** Telegram access, visible history and content protection still apply. A hidden-origin forward alone cannot identify its original message. Deleted posts are skipped. Source chats with protected content cannot be published.
 
@@ -83,23 +84,22 @@ New media in registered sources is indexed while the bot is online. Forward a ne
 
 - Send `Dune 2021 1080p`, `Dark S02E04` or `Vikram Tamil`. Tap **Filters** for language, quality, year, season or episode. A broad query shows up to 100 editions. Add a release detail to narrow it. Menus belong to their requester for 45 minutes.
 - For normal text search in groups, grant the bot admin access or disable privacy via BotFather’s `/setprivacy` and re-add the bot. With privacy enabled, use `/search@YourBot TITLE`. To enable inline results, use BotFather’s `/setinline`, then type `@YourBot title` in a chat. A configured search-group allowlist disables inline results because inline queries do not include a verifiable chat ID.
-- Tap an edition to open its private card, then **Get file** or **Save**. **Get page** delivers the editions on that page to the original requester. Each delivery checks the source post again.
+- Tap an edition to open its private card, then **Get file** or **Save**. **Get page** delivers the editions on that page to the original requester. Each delivery checks the source post again. Delivered copies expire after **5 minutes**. Forward to Saved Messages before expiry. If the owner enabled file protection, reopen the card to request another copy.
 - To enable browser playback, set **Stream URL** to this service’s public HTTPS origin. The card issues bearer links valid for 15 minutes. Anyone holding a link can use it during that period. Removing a source, revoking access or enabling file protection closes access on the next request. Browser playback needs a supported codec. Downloads and HTTP byte ranges work without storing media on disk.
-- To enable posters, enter your TMDB v3 key under **Brand & links**. Results use the parsed release title and year. TMDB outages or missing matches leave the ordinary file card available. This product uses the TMDB API and is not endorsed or certified by TMDB.
+- To enable posters, enter your TMDB v3 key under **Advanced**. Results use the parsed release title and year. TMDB outages or missing matches leave the ordinary file card available. This product uses the TMDB API and is not endorsed or certified by TMDB.
 
 ## ⚙ 𝐒𝐞𝐭𝐭𝐢𝐧𝐠𝐬 & 𝐜𝐨𝐦𝐦𝐚𝐧𝐝𝐬
 
 | Who | Commands and controls |
 | --- | --- |
 | Everyone | `/start`, `/help`, `/search TITLE`, `/saved`, `/request TITLE`, `/top`, `/myplan`, `/id`, `/ping` |
-| Each user, in private | `/usetting` or `/usettings` → language, quality, buttons/links, newest/oldest, file sizes. **Reset** restores one preference. |
-| Group administrator | `/settings` in the group → group search, spelling suggestions, welcome and result layout. The owner’s overall group access rules take precedence. |
-| Bot owner, in private | `/bsetting` or `/bsettings` → choose a section, tap a value, edit or reset. Use `/cancel` to discard a pending text entry. Bot and user settings survive restarts. |
-| Catalog administrator | `/index`, `/sindex`, `/jobs`, `/sources`, `/stats`, `/delete FILE_KEY`. A file key follows `f_` in its private link. Removing a catalog entry leaves the source post intact. |
+| Each user, in private | `/usettings` → language, quality, buttons/links, newest/oldest, file sizes. **Reset** restores one preference. |
+| Bot owner, in private | `/bsettings` → choose a section, tap a value, edit or reset. Use `/cancel` to discard a pending text entry. Bot and user settings survive restarts. |
+| Catalog administrator | `/index`, `/sindex`, `/jobs`, `/status`, `/sources`, `/stats`, `/delete FILE_KEY`. A file key follows `f_` in its private link. Removing an indexed post keeps other copies of that file available. |
 | Community moderator¹ | `/requests` lists open requests. Mark a title available or closed to notify the requester. `/filter KEYWORD \| REPLY`, `/filters`, `/unfilter KEYWORD` manage exact keyword replies. |
 | Audience management¹ | Reply in private to a message with `/broadcast` or `/grp_broadcast`, then confirm. `/ban ID`, `/unban ID`, `/add_premium USER_ID DAYS`, `/remove_premium USER_ID`. |
 
-¹ The owner and trusted catalog admins have these permissions. In **Chats & access**, enter numeric chat IDs or user IDs separated by spaces. Set **Requests chat** to direct requests to a moderation group, **Updates chat** for new-file announcements and **Log chat** for index summaries. **Updates link** is a public-facing button and can point somewhere else. For required memberships, make the bot an admin of each required channel and provide an accessible invite link. The bot owner alone can edit global settings.
+¹ The owner and trusted catalog admins have these permissions. In **Channels & access**, enter numeric chat IDs or user IDs separated by spaces. Set **Requests chat** to direct requests to a moderation group, **Updates chat** for new-file announcements and **LOG_CHANNEL** in the environment for operations logs. **Updates link** is a public-facing button and can point somewhere else. For required memberships, make the bot an admin of each required channel and provide an accessible invite link. The bot owner alone can edit global settings.
 
 ## 🚀 𝐃𝐞𝐩𝐥𝐨𝐲
 
@@ -107,12 +107,12 @@ Run **one always-on service per bot token**. Telegram uses an outbound MTProto c
 
 | Platform | Deployment |
 | --- | --- |
-| Linux VPS · Docker | Fill in `.env`, run `docker compose up -d --build` and inspect `docker compose logs -f bot`. Compose binds port 8080 to localhost. For streaming, proxy your HTTPS domain to it. Update with `git pull --ff-only && docker compose up -d --build`. |
+| Linux VPS · Docker | Fill in `.env`, run `docker compose up -d --build` and inspect `docker compose logs -f bot`. Compose binds port 8080 to localhost. For streaming, proxy your HTTPS domain to it. Update with `docker compose stop bot && git pull --ff-only && docker compose up -d --build`. |
 | Linux VPS · systemd | Install in `/opt/wovie`, create the virtualenv there and use the unit below. The service account needs read access to the checkout and its private environment file. |
-| Render | Use the deploy button, supply the five values and choose an always-on plan. The included Blueprint builds the Dockerfile and probes `/health`. |
-| Heroku | Use the deploy button and supply the five values. The included app manifest starts one web dyno. Use `heroku logs --tail` for logs. |
-| Railway / Koyeb | Import this GitHub repo as a Docker service, add the five secrets, set one replica, disable scale-to-zero and expose the assigned HTTP port. Set the health path to `/health`. |
-| Fly.io | Run `fly launch --no-deploy`, select the Dockerfile, set internal port 8080 and one always-on Machine. Set the five app secrets, run `fly deploy` and `fly scale count 1`. |
+| Render | Use the deploy button, supply the six values and choose an always-on plan. The included Blueprint builds the Dockerfile and probes `/health`. |
+| Heroku | Use the deploy button and supply the six values. The included app manifest starts one web dyno. Use `heroku logs --tail` for logs. |
+| Railway / Koyeb | Import this GitHub repo as a Docker service, add the six secrets, set one replica, disable scale-to-zero and expose the assigned HTTP port. Set the health path to `/health`. |
+| Fly.io | Run `fly launch --no-deploy`, select the Dockerfile, set internal port 8080 and one always-on Machine. Set the six app secrets, run `fly deploy` and `fly scale count 1`. |
 
 <details><summary>systemd service for a VPS</summary>
 
@@ -145,9 +145,11 @@ Run `sudo systemctl daemon-reload && sudo systemctl enable --now wovie`. Read lo
 ## 💾 𝐏𝐞𝐫𝐬𝐢𝐬𝐭𝐞𝐧𝐜𝐞 & 𝐫𝐞𝐜𝐨𝐯𝐞𝐫𝐲
 
 - A single URI is enough. For multiple databases, set `DATABASE_URI` to a JSON array, with the primary first. In a dotenv file, wrap the JSON in single quotes, e.g. `DATABASE_URI='["mongodb://mongo-a/wovie","mongodb://mongo-b/catalog2"]'`. In a hosting dashboard paste the JSON array directly.
-- The primary holds settings, users, watchlists, requests, jobs, source routes and Telegram peer information. A source keeps its assigned catalog database when another database is added. Keep all registered databases available and the same primary first. The service checks catalog identities at startup.
+- The primary holds settings, users, watchlists, requests, jobs, file routes and Telegram peer information. Each Telegram file identity keeps its assigned catalog database when another database is added. Reposts retain their source locations and share one searchable edition. Keep all registered databases available and the same primary first. The service checks catalog identities at startup.
 - Back up **every configured database** using MongoDB snapshots or stop the bot and take a `mongodump` of each one. Restore the full set to recover file routes and settings together. Verify restored catalogs and settings in an isolated environment. Start the original bot token against the restored copy only after stopping the previous process. Telegram holds the media itself. Retain your source posts.
-- The rewrite stores its data in `eva_*` collections. For an existing deployment of the previous Wovie implementation, keep its database backup. Register and re-index its sources in the new catalog. Previous bot/user settings use a different schema and can be re-entered in the panels.
+- **Upgrade from the EvaMaria-style release.** Stop the old worker, back up every configured database, pull the new commit and start one worker with the same bot token and MongoDB URIs. Existing `eva_files` catalogs migrate automatically in resumable batches. Old file links, preferences and job cursors survive. Allow space in MongoDB for the new index during migration. The original catalog collections remain available in the backup and database. A previously saved valid log channel is accepted when `LOG_CHANNEL` is absent. Older group overrides are archived in place. Group behavior now follows `/bsettings`.
+- **Move hosts.** Stop the old instance before starting the new one. Reuse the same bot token, MongoDB databases and optional indexing account. Pending file deletions and index jobs resume from MongoDB. Telegram can enforce its deletion time limit during a long outage.
+- **Read the dashboard.** `/stats` counts unique Telegram file IDs, indexed source posts, logical media bytes and allocated MongoDB data plus indexes across the configured databases. Monthly activity counts distinct humans seen in messages, callbacks or inline searches within 30 days. The old release recorded first contact only. Historical activity and Telegram blocks become observable as users interact or Telegram reports their state. Admin bans are shown separately.
 
 ## ♥ 𝐂𝐫𝐞𝐝𝐢𝐭𝐬
 

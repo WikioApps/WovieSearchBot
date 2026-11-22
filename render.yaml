@@ -16,3 +16,5 @@ services:
         sync: false
       - key: DATABASE_URI
         sync: false
+      - key: LOG_CHANNEL
+        sync: false

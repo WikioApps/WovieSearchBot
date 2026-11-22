@@ -3,7 +3,26 @@
 from html import escape
 
 from info import CHOICES, DEFAULTS, DESCRIPTIONS, PERSONAL, SECTIONS, parse_setting
-from Script import button, caps, head, keys
+from Script import button, caps, edit_panel, head, keys
+
+LABELS = {
+    "force_sub": "Required channels",
+    "pm_search": "Private search",
+    "layout": "Result layout",
+    "requests_chat": "Request inbox",
+    "updates_chat": "Announcement channel",
+    "sources": "Media sources",
+    "search_groups": "Allowed groups",
+    "start_pic": "Welcome image",
+    "start_text": "Welcome text",
+    "batch_size": "Index batch size",
+    "protect_files": "Protect deliveries",
+    "tmdb_key": "TMDB key",
+}
+
+
+def label(key):
+    return LABELS.get(key, key.replace("_", " "))
 
 
 def display(v):
@@ -31,7 +50,7 @@ async def panel(app, uid, scope, view="home", arg=None):
     )
 
     def item(k):
-        return button(caps(k.replace("_", " ")), prefix + "key:" + k)
+        return button(caps(label(k)), prefix + "key:" + k)
 
     if view == "home" and not personal:
         return title + "\n\nChoose a section.", keys(
@@ -39,7 +58,7 @@ async def panel(app, uid, scope, view="home", arg=None):
                 [button(caps(name), prefix + f"section:{i}")]
                 for i, name in enumerate(SECTIONS)
             ],
-            [button("✕ ᴄʟᴏꜱᴇ", "nav:close")],
+            [button("‹ ʜᴏᴍᴇ", "nav:home")],
         )
     if view in {"home", "section"}:
         fields = list(defaults) if personal else list(SECTIONS.values())[int(arg)]
@@ -47,18 +66,18 @@ async def panel(app, uid, scope, view="home", arg=None):
         return title + "\n\nChoose a setting.", keys(
             *rows,
             [
-                button("✕ ᴄʟᴏꜱᴇ", "nav:close")
+                button("‹ ʜᴏᴍᴇ", "nav:home")
                 if personal
                 else button("‹ ʙᴀᴄᴋ", prefix + "home")
             ],
         )
     if arg not in defaults:
         raise ValueError("Unknown setting.")
-    label = arg.replace("_", " ")
+    name = label(arg)
     lines = [
         title,
         "",
-        f"<b>{escape(caps(label))}</b>",
+        f"<b>{escape(caps(name))}</b>",
         escape(DESCRIPTIONS.get(arg, "Choose the value that this bot should use.")),
         f"Current · <code>{escape('••••••' if arg == 'tmdb_key' and cfg[arg] else display(cfg[arg]))}</code>",
         f"Default · <code>{escape(display(defaults[arg]))}</code>",
@@ -75,6 +94,11 @@ async def panel(app, uid, scope, view="home", arg=None):
             button(
                 ("✓ " if str(v).lower() == display(cfg[arg]).lower() else "") + caps(v),
                 prefix + f"set:{arg}:{v}",
+                style="danger"
+                if v == "off"
+                else "success"
+                if v == "on" or str(v).lower() == display(cfg[arg]).lower()
+                else "primary",
             )
             for v in choices
         ]
@@ -82,7 +106,11 @@ async def panel(app, uid, scope, view="home", arg=None):
     else:
         rows = [[button("✎ ᴇᴅɪᴛ", prefix + "edit:" + arg, style="primary")]]
     return "\n".join(lines), keys(
-        *rows, [button("↺ ʀᴇꜱᴇᴛ", prefix + "reset:" + arg), button("‹ ʙᴀᴄᴋ", back)]
+        *rows,
+        [
+            button("↺ ʀᴇꜱᴇᴛ", prefix + "reset:" + arg, style="danger"),
+            button("‹ ʙᴀᴄᴋ", back),
+        ],
     )
 
 
@@ -106,12 +134,16 @@ async def callback(app, q, parts):
         if key not in defaults:
             raise ValueError("Unknown setting.")
         if verb == "edit":
-            await app.db.prompt(uid, "setting", scope=scope, key=key)
-            return await q.message.reply_text(
+            await app.db.prompt(
+                uid, "setting", scope=scope, key=key, panel=q.message.id
+            )
+            return await edit_panel(
+                q.message,
                 head("✎", "Edit " + key.replace("_", " "))
                 + "\n\n"
                 + escape(DESCRIPTIONS.get(key, "Send the new value."))
-                + "\nSend /cancel to leave."
+                + "\nSend the new value in this chat.",
+                keys([button("‹ ʙᴀᴄᴋ", f"cfg:{scope}:key:{key}")]),
             )
         if verb == "reset":
             await app.db.setting(key, None, target, reset=True)
@@ -119,9 +151,7 @@ async def callback(app, q, parts):
             await app.db.setting(key, parse_setting(key, args[1], personal), target)
         verb = "key"
     text, markup = await panel(app, uid, scope, verb, key)
-    if q.message.photo:
-        return await q.message.reply_text(text, reply_markup=markup)
-    return await q.message.edit_text(text, reply_markup=markup)
+    return await edit_panel(q.message, text, markup)
 
 
 async def input_value(app, m, prompt):
@@ -142,63 +172,13 @@ async def input_value(app, m, prompt):
     await app.db.setting(key, value, uid if scope == "u" else None)
     await app.db.prompts.delete_one({"_id": uid, "kind": "setting", "key": key})
     text, markup = await panel(app, uid, scope, "key", key)
+    if prompt.get("panel"):
+        from pyrogram.errors import MessageIdInvalid
+
+        try:
+            old = await app.get_messages(uid, prompt["panel"], replies=0)
+            if old and not old.empty:
+                return await edit_panel(old, "✓ Saved\n\n" + text, markup)
+        except MessageIdInvalid:
+            pass
     await m.reply_text("✓ Saved\n\n" + text, reply_markup=markup)
-
-
-GROUP_FIELDS = ("group_search", "spell_check", "welcome", "layout")
-
-
-async def group_panel(app, m, user, verb=None, key=None):
-    from pyrogram import enums
-
-    if m.chat.id >= 0:
-        raise ValueError("Use /settings inside the group you manage.")
-    if user.id != app.owner:
-        member = await app.get_chat_member(m.chat.id, user.id)
-        if member.status not in {
-            enums.ChatMemberStatus.OWNER,
-            enums.ChatMemberStatus.ADMINISTRATOR,
-        }:
-            raise ValueError("Group administrator access required.")
-    coll = app.db.db.eva_groups
-    global_cfg = await app.db.config()
-    cfg = await group_config(app, m.chat.id, global_cfg)
-    if key in GROUP_FIELDS:
-        v = (
-            ("links" if cfg[key] == "buttons" else "buttons")
-            if key == "layout"
-            else not cfg[key]
-        )
-        await coll.update_one(
-            {"_id": m.chat.id}, {"$set": {f"values.{key}": v}}, upsert=True
-        )
-    elif verb == "reset":
-        await coll.delete_one({"_id": m.chat.id})
-    cfg = await group_config(app, m.chat.id, global_cfg)
-    markup = keys(
-        *[
-            [
-                button(
-                    caps(k.replace("_", " ")) + " · " + display(cfg[k]),
-                    f"grp:toggle:{k}",
-                )
-            ]
-            for k in GROUP_FIELDS
-        ],
-        [button("↺ ᴜꜱᴇ ʙᴏᴛ ᴅᴇꜰᴀᴜʟᴛꜱ", "grp:reset")],
-    )
-    text = head("⚙", "Group settings") + "\n\nTap a row to change it for this group."
-    if verb:
-        return await m.edit_text(text, reply_markup=markup)
-    await m.reply_text(text, reply_markup=markup)
-
-
-async def group_config(app, chat, cfg):
-    if chat >= 0:
-        return cfg
-    row = await app.db.db.eva_groups.find_one({"_id": chat})
-    overrides = (row or {}).get("values", {}).copy()
-    # The owner can turn off all group searching, including customized groups.
-    if not cfg["group_search"]:
-        overrides.pop("group_search", None)
-    return cfg | overrides

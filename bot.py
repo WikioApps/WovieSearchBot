@@ -10,20 +10,21 @@ from time import monotonic
 
 from aiohttp import ClientSession, web
 from pymongo.errors import PyMongoError
-from pyrogram import Client, enums, idle, types
+from pyrogram import Client, enums, idle, raw, types
 from pyrogram.errors import FloodWait, MessageNotModified, RPCError
 
 from database.ia_filterdb import Store, norm, now
 from info import bootstrap
 from plugins import commands, index, media, settings
 from plugins import pm_filter as search
-from Script import HELP, button, head, home, keys
+from Script import HELP, button, channels, edit_panel, head, home, keys
 
 log = logging.getLogger("wovie")
 OPERATIONS = {
     "index",
     "sindex",
     "jobs",
+    "status",
     "stats",
     "sources",
     "index_channels",
@@ -47,7 +48,6 @@ PUBLIC = {
     "top": "Trending searches",
     "myplan": "View your membership",
     "usettings": "Personal search settings",
-    "settings": "Group settings",
     "id": "Show Telegram IDs",
     "help": "Search guide",
 }
@@ -80,14 +80,30 @@ async def banned(app, *ids):
     )
 
 
+async def activity(app, uid, *, private=False):
+    stamp = now()
+    changes = {"$min": {"seen": stamp}, "$max": {"last_seen": stamp}}
+    if private:
+        changes["$set"] = {"dm": True, "blocked": False, "deactivated": False}
+    await app.db.users.update_one({"_id": uid}, changes, upsert=True)
+
+
 async def register(app, chat):
-    r = await app.db.users.update_one(
-        {"_id": chat.id}, {"$min": {"seen": now()}}, upsert=True
-    )
-    if r.upserted_id is not None or not await app.db.peers.find_one(
-        {"_id": chat.id}, {"_id": 1}
-    ):
+    if chat.id < 0:
+        await app.db.users.update_one(
+            {"_id": chat.id}, {"$min": {"seen": now()}}, upsert=True
+        )
+    if not await app.db.peers.find_one({"_id": chat.id}, {"_id": 1}):
         await index.remember(app, chat)
+
+
+def help_keys(app, chat):
+    back = (
+        button("‹ ʜᴏᴍᴇ", "nav:home")
+        if chat > 0
+        else button("‹ ʜᴏᴍᴇ", url=search.link(app, "home"))
+    )
+    return keys([back])
 
 
 async def handle(app, m):
@@ -104,7 +120,7 @@ async def handle(app, m):
     uid = m.from_user.id
     if await banned(app, uid, chat):
         return
-    cfg = await settings.group_config(app, chat, cfg)
+    await activity(app, uid, private=chat == uid)
     if chat > 0 or m.text or m.new_chat_members:
         await register(app, m.chat)
     if m.new_chat_members and cfg["welcome"]:
@@ -126,14 +142,14 @@ async def handle(app, m):
         arg = arg.strip()
         if cmd == "cancel":
             await app.db.prompts.delete_one({"_id": uid})
-            return await m.reply_text("✓ Input cancelled.")
+            return await m.reply_text("✓ Input cancelled.", reply_markup=keys())
         if cmd == "start":
             if chat > 0 and arg.startswith("f_"):
                 return await search.file_card(app, m, arg[2:], cfg)
             if chat > 0 and (match := re.fullmatch(r"p_([a-f0-9]{12})_(\d{1,2})", arg)):
                 return await search.send_page(app, m, match[1], int(match[2]), cfg)
             if arg == "help":
-                return await m.reply_text(HELP)
+                return await m.reply_text(HELP, reply_markup=help_keys(app, chat))
             if chat < 0:
                 return await m.reply_text(
                     head("🎬", cfg["bot_title"])
@@ -143,20 +159,13 @@ async def handle(app, m):
                     ),
                 )
             return await welcome(app, m, cfg)
-        if cmd in {"bsetting", "bsettings", "botsettings"}:
-            return await settings.open_panel(app, m, "b")
-        if cmd in {"usetting", "usettings", "usersettings"}:
-            return await settings.open_panel(app, m, "u")
-        if cmd == "settings":
-            return await (
-                settings.group_panel(app, m, m.from_user)
-                if chat < 0
-                else settings.open_panel(app, m, "u")
-            )
+        if cmd in {"bsettings", "usettings"}:
+            return await settings.open_panel(app, m, "b" if cmd == "bsettings" else "u")
         if cmd == "search":
             if not arg:
                 return await m.reply_text(
-                    "🔎 Use /search followed by a movie or series title."
+                    "🔎 Use /search followed by a movie or series title.",
+                    reply_markup=keys(),
                 )
             return await search.start_search(app, m, arg, cfg)
         if cmd == "saved":
@@ -164,10 +173,11 @@ async def handle(app, m):
         if cmd == "request":
             return await commands.request_title(app, m, uid, arg, cfg)
         if cmd == "help":
-            return await m.reply_text(HELP)
+            return await m.reply_text(HELP, reply_markup=help_keys(app, chat))
         if cmd == "id":
             return await m.reply_text(
-                f"User · <code>{uid}</code>\nChat · <code>{chat}</code>"
+                f"User · <code>{uid}</code>\nChat · <code>{chat}</code>",
+                reply_markup=keys(),
             )
         if cmd == "myplan":
             return await commands.plan(app, m, uid)
@@ -175,20 +185,26 @@ async def handle(app, m):
             return await commands.trending(app, m, cfg)
         if cmd == "ping":
             start = monotonic()
-            msg = await m.reply_text("🏓 …")
-            return await msg.edit_text(f"🏓 {1000 * (monotonic() - start):.0f} ms")
+            msg = await m.reply_text("🏓 …", reply_markup=keys())
+            return await msg.edit_text(
+                f"🏓 {1000 * (monotonic() - start):.0f} ms", reply_markup=keys()
+            )
         if cmd in OPERATIONS:
             if not operator:
                 raise ValueError("Catalog admin access required.")
             if cmd in {"index", "sindex"}:
                 return await index.propose(app, m, arg, session=cmd == "sindex")
+            if cmd == "status":
+                return await index.watch(app, m, uid)
             if cmd == "jobs":
                 return await index.status(app, m)
             if cmd in {"add_premium", "remove_premium"}:
                 return await commands.set_plan(app, m, cmd, arg)
             return await commands.admin_command(app, m, cmd, arg, cfg)
         if chat > 0:
-            return await m.reply_text("Use /help to see the available commands.")
+            return await m.reply_text(
+                "Use /help to see the available commands.", reply_markup=keys()
+            )
         return
     if chat > 0:
         pending = await app.db.user_prompt(uid)
@@ -205,7 +221,7 @@ async def handle(app, m):
         custom = await app.db.db.eva_filters.find_one({"_id": norm(text)})
         if custom:
             return await m.reply_text(
-                custom["text"], parse_mode=enums.ParseMode.DISABLED
+                custom["text"], parse_mode=enums.ParseMode.DISABLED, reply_markup=keys()
             )
         return await search.start_search(app, m, text, cfg)
 
@@ -216,13 +232,18 @@ async def callback(app, q):
     uid, chat = q.from_user.id, q.message.chat.id
     if await banned(app, uid, chat):
         raise ValueError("Access is disabled.")
-    cfg = await settings.group_config(app, chat, await app.db.config())
+    await activity(app, uid)
+    cfg = await app.db.config()
     family, *parts = q.data.split(":")
     verb = parts[0] if parts else ""
     if family == "cfg":
         return await settings.callback(app, q, parts)
-    if family == "grp":
-        return await settings.group_panel(app, q.message, q.from_user, *parts)
+    if family in {"stats", "dash"}:
+        if uid not in {app.owner, *cfg["admins"]}:
+            raise ValueError("Catalog admin access required.")
+        if family == "stats":
+            return await commands.stats(app, q.message, cfg, edit=True)
+        return await index.watch(app, q.message, uid, edit=True)
     if family == "s":
         return await search.search_action(app, q, parts, cfg)
     if family == "f":
@@ -238,14 +259,45 @@ async def callback(app, q):
             else commands.broadcast_action(app, q, *parts)
         )
     if family == "nav":
+        if verb == "close":
+            original = q.message.reply_to_message
+            if (
+                chat < 0
+                and uid not in {app.owner, *cfg["admins"]}
+                and not original
+                and q.message.reply_to_message_id
+            ):
+                original = await app.get_messages(
+                    chat, q.message.reply_to_message_id, replies=0
+                )
+            if (
+                chat != uid
+                and uid not in {app.owner, *cfg["admins"]}
+                and not (
+                    original and original.from_user and original.from_user.id == uid
+                )
+            ):
+                raise ValueError(
+                    "Only the requester or a bot admin can close this panel."
+                )
+            await q.message.delete()
+            await app.db.db.eva_status.delete_many({"chat": chat, "mid": q.message.id})
+            if chat == uid:
+                await app.db.prompts.delete_one({"_id": uid, "panel": q.message.id})
+            return
         if verb == "help":
-            return await q.message.reply_text(HELP)
+            return await edit_panel(q.message, HELP, help_keys(app, chat))
+        if verb == "links":
+            return await edit_panel(q.message, *channels(cfg))
+        if verb == "home" and chat == uid:
+            await app.db.prompts.delete_one({"_id": uid})
+            return await edit_panel(
+                q.message, *home(cfg, q.from_user, app.owner, app.me.username)
+            )
         if verb == "saved":
             return await search.show_saved(
-                app, q.message, uid, int(parts[1]) if len(parts) > 1 else 0
+                app, q.message, uid, int(parts[1]) if len(parts) > 1 else 0, edit=True
             )
-        if verb == "close" and chat == uid:
-            return await q.message.delete()
 
 
 def handlers(app):
@@ -256,15 +308,19 @@ def handlers(app):
             await handle(client, m)
         except FloodWait as e:
             await m.reply_text(
-                f"Telegram requested a pause. Try again in {e.value} seconds."
+                f"Telegram requested a pause. Try again in {e.value} seconds.",
+                reply_markup=keys(),
             )
         except ValueError as e:
-            await m.reply_text(str(e), parse_mode=enums.ParseMode.DISABLED)
+            await m.reply_text(
+                str(e), parse_mode=enums.ParseMode.DISABLED, reply_markup=keys()
+            )
         except (RPCError, PyMongoError):
             log.exception("Message could not be completed")
             if m.chat and m.chat.type != enums.ChatType.CHANNEL:
                 await m.reply_text(
-                    "This action is temporarily unavailable. Check the bot’s chat permissions or try again shortly."
+                    "This action is temporarily unavailable. Check the bot’s chat permissions or try again shortly.",
+                    reply_markup=keys(),
                 )
 
     @app.on_edited_message()
@@ -288,22 +344,72 @@ def handlers(app):
         except MessageNotModified:
             pass
         except FloodWait as e:
-            await q.message.reply_text(f"Try again in {e.value} seconds.")
+            await q.message.reply_text(
+                f"Try again in {e.value} seconds.", reply_markup=keys()
+            )
         except (ValueError, KeyError, IndexError) as e:
-            await q.message.reply_text(str(e), parse_mode=enums.ParseMode.DISABLED)
+            await q.message.reply_text(
+                str(e), parse_mode=enums.ParseMode.DISABLED, reply_markup=keys()
+            )
         except (RPCError, PyMongoError):
             log.exception("Button action failed")
             if q.message:
                 await q.message.reply_text(
-                    "The action could not finish. Reopen the menu or try again shortly."
+                    "The action could not finish. Reopen the menu or try again shortly.",
+                    reply_markup=keys(),
                 )
+
+    @app.on_raw_update(group=1)
+    async def membership(client, update, users, chats):
+        if isinstance(update, raw.types.UpdateBotStopped):
+            await client.ready.wait()
+            await client.db.users.update_one(
+                {"_id": update.user_id},
+                {
+                    "$set": {"blocked": bool(update.stopped), "dm": True},
+                    "$min": {"seen": now()},
+                },
+                upsert=True,
+            )
 
     @app.on_inline_query()
     async def inline(client, q):
         await client.ready.wait()
         if await banned(client, q.from_user.id):
             return await q.answer([], cache_time=0, is_personal=True)
+        await activity(client, q.from_user.id)
         await search.inline(client, q, await client.db.config())
+
+
+async def configure_log(app):
+    stored = await app.db.db.eva_meta.find_one({"_id": "log-channel"}) or {}
+    old = await app.db.state.find_one({"_id": "bot"}, {"values.log_chat": 1}) or {}
+    value = (
+        os.getenv("LOG_CHANNEL", "").strip()
+        or stored.get("chat")
+        or old.get("values", {}).get("log_chat")
+    )
+    if not value:
+        raise ValueError(
+            "Set LOG_CHANNEL to the Telegram channel ID or @username and give the bot permission to post."
+        )
+    target = int(value) if str(value).lstrip("-").isdigit() else value
+    try:
+        chat = await app.get_chat(target)
+        if chat.type != enums.ChatType.CHANNEL:
+            raise ValueError("LOG_CHANNEL must identify a Telegram channel.")
+        await app.send_message(
+            chat.id, head("🎬", "Bot connected") + "\nPreparing the catalog."
+        )
+    except RPCError as e:
+        raise ValueError(
+            "Cannot post to LOG_CHANNEL. Check its ID, add the bot as a channel administrator with Post Messages, and restart."
+        ) from e
+    await index.remember(app, chat)
+    app.log_channel = chat.id
+    await app.db.db.eva_meta.update_one(
+        {"_id": "log-channel"}, {"$set": {"chat": chat.id}}, upsert=True
+    )
 
 
 async def run():
@@ -363,6 +469,9 @@ async def run():
             await app.storage.update_peers(
                 [(p["_id"], p["hash"], p["type"], None) for p in batch]
             )
+        await configure_log(app)
+        await app.db.upgrade_catalog()
+        await app.db.upgrade_audience()
         app.ready.set()
         await app.set_bot_commands([types.BotCommand(k, v) for k, v in PUBLIC.items()])
         if port:
@@ -393,6 +502,8 @@ async def run():
         tasks = [
             asyncio.create_task(index.worker(app)),
             asyncio.create_task(commands.housekeeping(app)),
+            asyncio.create_task(commands.expiry_worker(app)),
+            asyncio.create_task(index.dashboards(app)),
         ]
         try:
             log.info("Ready as @%s", app.me.username)

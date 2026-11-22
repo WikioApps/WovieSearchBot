@@ -11,6 +11,7 @@
     "API_HASH": {"description": "Matching Telegram API hash"},
     "BOT_TOKEN": {"description": "BotFather token"},
     "OWNER_ID": {"description": "Your numeric Telegram user ID"},
+    "LOG_CHANNEL": {"description": "Telegram log channel ID or @username. Give the bot Post Messages permission."},
     "DATABASE_URI": {"description": "MongoDB URI with database name, or JSON list with primary first"}
   }
 }

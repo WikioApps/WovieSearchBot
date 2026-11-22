@@ -81,7 +81,10 @@ async def stream_buttons(app, uid, key, cfg):
         }
     )
     base = cfg["stream_url"].rstrip("/") + "/media/" + token
-    return [button("▶ ᴡᴀᴛᴄʜ", url=base), button("⬇ ᴅᴏᴡɴʟᴏᴀᴅ", url=base + "?download=1")]
+    return [
+        button("▶ ᴡᴀᴛᴄʜ", url=base),
+        button("⬇ ᴅᴏᴡɴʟᴏᴀᴅ", url=base + "?download=1", style="success"),
+    ]
 
 
 def byte_range(value, total):
@@ -122,7 +125,7 @@ async def serve(app, req):
             if await missing_membership(app, grant["uid"], cfg):
                 raise web.HTTPForbidden()
             d = await entry(app, grant["file"], cfg)
-            post, media = await original(app, d)
+            post, media = await original(app, d, cfg)
         except (ValueError, RPCError):
             raise web.HTTPNotFound() from None
         total = media.file_size or 0

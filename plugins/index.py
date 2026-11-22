@@ -9,12 +9,12 @@ import secrets
 from datetime import timedelta
 from html import escape
 
-from pymongo import ReplaceOne
 from pyrogram import enums
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import FloodWait, MessageIdInvalid, MessageNotModified, RPCError
 
 from database.ia_filterdb import file_doc, now
-from Script import button, head, keys
+from plugins.commands import audit
+from Script import button, duration, head, keys, release
 
 log = logging.getLogger(__name__)
 ACTIVE = {"$in": ["queued", "running"]}
@@ -96,7 +96,9 @@ async def propose(app, m, text="", session=False):
     else:
         if m.chat.id > 0:
             await app.db.prompt(uid, "index", session=session)
-        return await m.reply_text(head("🗂", "Index a source") + "\n\n" + INDEX_HELP)
+        return await m.reply_text(
+            head("🗂", "Index a source") + "\n\n" + INDEX_HELP, reply_markup=keys()
+        )
     if not 0 <= skip < last < 2**31:
         raise ValueError("The last message ID must exceed the skipped ID.")
     try:
@@ -150,26 +152,130 @@ async def propose(app, m, text="", session=False):
 
 
 def progress(j):
-    pct = 100 * (j["cursor"] - j["skip"]) / max(1, j["last"] - j["skip"])
-    return (
-        head("🗂", "Index manager")
-        + f"\n\n<b>{escape(j['title'] or str(j['source']))}</b>\n{escape(j['status'])} · {pct:.0f}%\n"
-    )
+    done = j["cursor"] - j["skip"]
+    total = j["last"] - j["skip"]
+    pct = min(1, done / max(total, 1))
+    filled = int(pct * 12)
+    bar = "▰" * filled + "▱" * (12 - filled)
+    state = j["status"].title()
+    wait = (j.get("after") or now()) - now()
+    rate = j.get("rate", 0)
+    line = f"{bar}  {pct:.0%}\n{state} · {done:,} / {total:,} posts"
+    if j["status"] == "running":
+        if wait.total_seconds() > 1:
+            line += f"\nWaiting {duration(wait.total_seconds())} for Telegram"
+        elif rate:
+            line += f"\n{rate:.1f} posts/s · ETA {duration((total - done) / rate)}"
+    line += f"\nNew {j.get('added', 0):,} · Repeats {j.get('repeats', 0):,} · Media posts {j['indexed']:,}"
+    return "<b>" + escape(j.get("title") or str(j["source"])) + "</b>\n" + line
 
 
 def card(j):
-    text = (
-        progress(j)
-        + f"Cursor <code>{j['cursor']:,}/{j['last']:,}</code> · Media <b>{j['indexed']:,}</b>"
-    )
+    text = head("🎞", "Index status") + "\n\n" + progress(j)
     if j.get("error"):
         text += "\n" + escape(j["error"])
     actions = []
     if j["status"] in {"queued", "running", "draft"}:
-        actions.append(button("⏹ ꜱᴛᴏᴘ", f"idx:stop:{j['_id']}"))
+        actions.append(button("⏹ ꜱᴛᴏᴘ", f"idx:stop:{j['_id']}", style="danger"))
     if j["status"] in {"paused", "failed"}:
-        actions.append(button("▶ ʀᴇꜱᴜᴍᴇ", f"idx:resume:{j['_id']}"))
+        actions.append(button("▶ ʀᴇꜱᴜᴍᴇ", f"idx:resume:{j['_id']}", style="success"))
     return text, keys(actions, [button("↻ ʀᴇꜰʀᴇꜱʜ", f"idx:view:{j['_id']}")])
+
+
+async def dashboard(app, uid):
+    who = {} if uid == app.owner else {"actor": uid}
+    coll = app.db.jobs
+    query = who | {"status": ACTIVE}
+    jobs = await coll.find(query).sort("created", 1).limit(4).to_list(4)
+    total = await coll.count_documents(query)
+    text = head("🎞", "Index dashboard") + f"\n{total:,} active jobs"
+    if not jobs:
+        latest = await coll.find_one(
+            who | {"status": {"$in": ["complete", "failed", "paused", "cancelled"]}},
+            sort=[("created", -1)],
+        )
+        text += "\n\n" + (
+            progress(latest)
+            if latest
+            else "Forward the last source post to start indexing."
+        )
+    else:
+        text += "\n\n" + "\n\n".join(progress(j) for j in jobs)
+        if total > 4:
+            text += f"\n+{total - 4} more in /jobs"
+    return text, keys([button("↻ ʀᴇꜰʀᴇꜱʜ", "dash:refresh")]), total
+
+
+async def watch(app, m, uid, *, edit=False):
+    ident = f"{m.chat.id}:{uid}"
+    coll = app.db.db.eva_status
+    text, markup, _ = await dashboard(app, uid)
+    row = await coll.find_one({"_id": ident})
+    mid = m.id if edit else (row or {}).get("mid")
+    if edit and m.photo:
+        mid = (await m.reply_text(text, reply_markup=markup)).id
+        await m.delete()
+    elif mid:
+        try:
+            await app.edit_message_text(m.chat.id, mid, text, reply_markup=markup)
+        except MessageNotModified:
+            pass
+        except MessageIdInvalid:
+            mid = None
+    if not mid:
+        mid = (await m.reply_text(text, reply_markup=markup)).id
+    await coll.replace_one(
+        {"_id": ident},
+        {
+            "_id": ident,
+            "chat": m.chat.id,
+            "uid": uid,
+            "mid": mid,
+            "text": text,
+            "next": now() + timedelta(seconds=10),
+            "expires": now() + timedelta(days=1),
+        },
+        upsert=True,
+    )
+
+
+async def dashboards(app):
+    coll = app.db.db.eva_status
+    while True:
+        try:
+            async for row in coll.find({"next": {"$lte": now()}}).limit(20):
+                key = {"_id": row["_id"], "mid": row["mid"]}
+                cfg = await app.db.config()
+                if row["uid"] not in {app.owner, *cfg["admins"]}:
+                    await coll.delete_one(key)
+                    continue
+                text, markup, active = await dashboard(app, row["uid"])
+                delay = 10 if active else 30
+                if text != row["text"]:
+                    try:
+                        await app.edit_message_text(
+                            row["chat"], row["mid"], text, reply_markup=markup
+                        )
+                    except MessageNotModified:
+                        pass
+                    except FloodWait as e:
+                        await coll.update_one(
+                            key,
+                            {"$set": {"next": now() + timedelta(seconds=e.value + 1)}},
+                        )
+                        continue
+                    except RPCError as e:
+                        if e.CODE >= 500:
+                            raise
+                        await coll.delete_one(key)
+                        continue
+                patch = {"text": text, "next": now() + timedelta(seconds=delay)}
+                if active:
+                    patch["expires"] = now() + timedelta(days=1)
+                await coll.update_one(key, {"$set": patch})
+        except Exception:
+            log.exception("Status refresh deferred")
+        await asyncio.sleep(3)
 
 
 async def action(app, q, verb, key, cfg):
@@ -179,12 +285,13 @@ async def action(app, q, verb, key, cfg):
     j = await app.db.jobs.find_one({"_id": key})
     if not j or (uid != app.owner and uid != j["actor"]):
         raise ValueError("This index job belongs to another operator.")
+    changed = None
     if verb in {"go", "resume"}:
         allowed = ["draft"] if verb == "go" else ["failed", "paused"]
         if j["status"] in allowed:
             await source_chat(app, j["source"])
             await app.db.add_source(j["source"])
-            await app.db.jobs.update_one(
+            changed = await app.db.jobs.update_one(
                 {"_id": key, "status": {"$in": allowed}},
                 {
                     "$set": {
@@ -193,16 +300,19 @@ async def action(app, q, verb, key, cfg):
                         "notify": q.message.chat.id,
                         "panel": q.message.id,
                         "after": now(),
+                        "rate": 0,
                     }
                 },
             )
     elif verb == "stop":
-        await app.db.jobs.update_one(
+        changed = await app.db.jobs.update_one(
             {"_id": key, "status": {"$in": ["draft", "queued", "running"]}},
             {"$set": {"status": "paused" if j["status"] != "draft" else "cancelled"}},
         )
     j = await app.db.jobs.find_one({"_id": key})
     text, markup = card(j)
+    if changed and changed.modified_count:
+        await audit(app, text)
     await q.message.edit_text(text, reply_markup=markup)
 
 
@@ -217,9 +327,7 @@ async def status(app, m):
                 [button(f"{j['status']} · {j['title']}"[:65], f"idx:view:{j['_id']}")]
                 for j in jobs
             ]
-        )
-        if jobs
-        else None,
+        ),
     )
 
 
@@ -230,10 +338,12 @@ async def notify(app, j, cfg):
             await app.edit_message_text(
                 j["notify"], j["panel"], text, reply_markup=markup
             )
-        if cfg["log_chat"]:
-            await app.send_message(cfg["log_chat"], text)
+    except MessageNotModified:
+        pass
     except RPCError:
-        log.info("Index status notification unavailable", exc_info=True)
+        log.info("Index status panel unavailable", exc_info=True)
+    if j["status"] in {"complete", "failed"}:
+        await audit(app, text)
 
 
 async def batch(app, j, cfg):
@@ -241,6 +351,7 @@ async def batch(app, j, cfg):
         raise ValueError("Source removed from bot settings.")
     if j["actor"] != app.owner and j["actor"] not in cfg["admins"]:
         raise ValueError("Index operator access was removed.")
+    tick = asyncio.get_running_loop().time()
     chat = await source_chat(app, j["source"])
     end = min(j["last"], j["cursor"] + cfg["batch_size"])
     reader = app
@@ -266,24 +377,39 @@ async def batch(app, j, cfg):
         for m in messages
         if m and not m.empty and m.chat and m.chat.id == chat.id and (d := file_doc(m))
     ]
-    if docs:
-        coll = await app.db.collection(chat.id)
-        await coll.bulk_write(
-            [ReplaceOne({"_id": d["_id"]}, d, upsert=True) for d in docs], ordered=False
-        )
+    added = await app.db.catalog_write(docs, stamp=f"{j['_id']}:{j['cursor']}")
     state = "complete" if end == j["last"] else "running"
+    rate = (end - j["cursor"]) / (
+        max(0.001, asyncio.get_running_loop().time() - tick) + 0.6
+    )
+    previous = j.get("rate", 0)
+    refresh = (
+        state == "complete"
+        or not j.get("panel_tick")
+        or (now() - j["panel_tick"]).total_seconds() >= 10
+    )
+    fields = {
+        "cursor": end,
+        "status": state,
+        "error": "",
+        "attempts": 0,
+        "rate": rate if not previous else 0.7 * previous + 0.3 * rate,
+    }
+    if refresh:
+        fields["panel_tick"] = now()
     updated = await app.db.jobs.find_one_and_update(
         {"_id": j["_id"], "status": "running", "cursor": j["cursor"]},
         {
-            "$set": {"cursor": end, "status": state, "error": "", "attempts": 0},
-            "$inc": {"indexed": len(docs)},
+            "$set": fields,
+            "$inc": {
+                "indexed": len(docs),
+                "added": added,
+                "repeats": len(docs) - added,
+            },
         },
         return_document=True,
     )
-    if updated and (
-        state == "complete"
-        or (end - j["skip"]) // 1000 != (j["cursor"] - j["skip"]) // 1000
-    ):
+    if updated and refresh:
         await notify(app, updated, cfg)
 
 
@@ -340,17 +466,17 @@ async def live(app, m, cfg, *, edited=False):
             await remove_posts(app, [m], cfg)
         return
     await remember(app, m.chat)
-    coll = await app.db.collection(m.chat.id)
-    result = await coll.replace_one({"_id": d["_id"]}, d, upsert=True)
-    if result.upserted_id and cfg["updates_chat"] and cfg["updates_chat"] != m.chat.id:
+    created = await app.db.catalog_write([d])
+    if created and cfg["updates_chat"] and cfg["updates_chat"] != m.chat.id:
         await app.send_message(
             cfg["updates_chat"],
-            head("🎬", "Just added") + "\n" + escape(d["name"]),
+            head("🎬", "Just added") + "\n" + escape(release(d["name"])),
             reply_markup=keys(
                 [
                     button(
                         "📥 ᴠɪᴇᴡ ꜰɪʟᴇ",
                         url=f"https://t.me/{app.me.username}?start=f_{d['_id']}",
+                        style="success",
                     )
                 ]
             ),
@@ -362,6 +488,7 @@ async def remove_posts(app, messages, cfg):
     for m in messages:
         if m.chat and m.chat.id in cfg["sources"]:
             sources.setdefault(m.chat.id, []).append(f"{abs(m.chat.id):x}_{m.id:x}")
-    for source, ids in sources.items():
-        coll = await app.db.collection(source)
-        await coll.delete_many({"_id": {"$in": ids}})
+    if sources:
+        await app.db.catalog_write(
+            removed=[key for ids in sources.values() for key in ids]
+        )

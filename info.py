@@ -28,12 +28,10 @@ DEFAULTS = {
     "force_sub": [],
     "requests_chat": 0,
     "updates_chat": 0,
-    "log_chat": 0,
     "pm_search": True,
     "group_search": True,
     "spell_check": True,
     "protect_files": False,
-    "auto_delete": 0,
     "batch_size": 50,
     "page_size": 8,
     "layout": "buttons",
@@ -47,7 +45,7 @@ PERSONAL = {
     "show_size": True,
 }
 SECTIONS = {
-    "Brand & links": (
+    "Welcome & links": (
         "bot_title",
         "start_text",
         "start_pic",
@@ -55,32 +53,28 @@ SECTIONS = {
         "support_link",
         "films_link",
         "tutorial_link",
-        "caption",
-        "stream_url",
-        "tmdb_key",
-        "premium_stream",
     ),
-    "Chats & access": (
+    "Channels & access": (
         "sources",
         "search_groups",
         "admins",
         "force_sub",
         "requests_chat",
         "updates_chat",
-        "log_chat",
     ),
-    "Search & files": (
+    "Search & delivery": (
         "pm_search",
         "group_search",
         "spell_check",
-        "protect_files",
-        "auto_delete",
-        "batch_size",
         "page_size",
         "layout",
+        "caption",
+        "protect_files",
         "welcome",
     ),
+    "Advanced": ("batch_size", "stream_url", "premium_stream", "tmdb_key"),
 }
+DELETE_AFTER = 300
 LANGUAGES = (
     "english",
     "hindi",
@@ -113,12 +107,10 @@ DESCRIPTIONS = {
     "start_pic": "Send a Telegram photo, its file ID or a public HTTPS image URL. Reset for a text welcome.",
     "start_text": "Welcome text. Fields: {name}, {bot}.",
     "caption": "File caption. Fields: {filename}, {size}, {title}, {quality}, {language}.",
-    "auto_delete": "Seconds before deleting delivered messages. 0 keeps them.",
     "batch_size": "Message IDs per indexing request, 1–100.",
     "page_size": "File rows per page, 3–10.",
     "updates_chat": "Destination for announcements of new live media. 0 turns this off.",
     "requests_chat": "Destination for title requests. 0 sends them to the owner.",
-    "log_chat": "Destination for index summaries. 0 turns this off.",
 }
 
 
@@ -185,7 +177,6 @@ def parse_setting(key, value, personal=False):
         low, high = {
             "page_size": (3, 10),
             "batch_size": (1, 100),
-            "auto_delete": (0, 172000),
         }.get(key, (-(2**53), 0))
         try:
             n = int(value)

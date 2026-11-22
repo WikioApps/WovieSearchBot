@@ -5,11 +5,17 @@ from html import escape
 from math import ceil
 
 from pyrogram import enums, types
-from pyrogram.errors import RPCError, UserNotParticipant
+from pyrogram.errors import (
+    ChannelPrivate,
+    MessageIdInvalid,
+    PeerIdInvalid,
+    RPCError,
+    UserNotParticipant,
+)
 
 from database.ia_filterdb import now, preferred_filters
-from info import LANGUAGES, QUALITIES
-from Script import button, caps, head, keys, size
+from info import DELETE_AFTER, LANGUAGES, QUALITIES
+from Script import button, caps, edit_panel, head, keys, release, size
 
 FACETS = {
     "language": "🌐",
@@ -74,7 +80,9 @@ async def gate(app, uid, cfg):
 async def start_search(app, m, query, cfg):
     uid = m.from_user.id
     if not allowed(m.chat.id, cfg):
-        return await m.reply_text("Search is disabled in this chat.")
+        return await m.reply_text(
+            "Search is disabled in this chat.", reply_markup=keys()
+        )
     if block := await gate(app, uid, cfg):
         return await m.reply_text(block[0], reply_markup=block[1])
     query = query.strip()
@@ -107,13 +115,16 @@ async def start_search(app, m, query, cfg):
 
 async def render(app, s, cfg, pref, page, refresh=False):
     key = s["_id"]
-    if refresh or "hits" not in s:
+    if refresh or s.get("version") != 2 or "hits" not in s:
         rows, suggestions = await app.db.search(
             s["query"], s["filters"], cfg["sources"], pref["sort"], cfg["spell_check"]
         )
-        s.update(hits=rows[:100], more=len(rows) > 100, suggestions=suggestions)
+        s.update(
+            version=2, hits=rows[:100], more=len(rows) > 100, suggestions=suggestions
+        )
         await app.db.sessions.update_one(
-            {"_id": key}, {"$set": {k: s[k] for k in ("hits", "more", "suggestions")}}
+            {"_id": key},
+            {"$set": {k: s[k] for k in ("hits", "more", "suggestions", "version")}},
         )
     hits = [r for r in s["hits"] if r["source"] in cfg["sources"]]
     title = head("🎬", "Auto filter") + "\n\n🔎 <b>" + escape(s["query"]) + "</b>"
@@ -140,10 +151,12 @@ async def render(app, s, cfg, pref, page, refresh=False):
     keyboard = []
     layout = cfg["layout"] if pref["layout"] == "default" else pref["layout"]
     for i, r in enumerate(hits[page * n : (page + 1) * n], page * n + 1):
-        label = (f"[{size(r['bytes'])}] " if pref["show_size"] else "") + r["name"]
+        label = release(r["name"])[:53] + (
+            f"  ·  {size(r['bytes'])}" if pref["show_size"] else ""
+        )
         url = link(app, "f_" + r["_id"])
         if layout == "buttons":
-            keyboard.append([button(label[:72], url=url)])
+            keyboard.append([button(label[:72], url=url, style="success")])
         else:
             title += f'\n{i}. <a href="{url}">{escape(label[:100])}</a>'
     navigation = []
@@ -151,13 +164,15 @@ async def render(app, s, cfg, pref, page, refresh=False):
         navigation.append(button("‹ ᴘʀᴇᴠ", f"s:{key}:page:{page - 1}"))
     navigation.append(button(f"{page + 1} / {pages}", f"s:{key}:page:{page}"))
     if page + 1 < pages:
-        navigation.append(button("ɴᴇxᴛ ›", f"s:{key}:page:{page + 1}"))
+        navigation.append(button("ɴᴇxᴛ ›", f"s:{key}:page:{page + 1}", style="success"))
     keyboard.extend(
         [
             navigation,
             [
                 button("🎚 ꜰɪʟᴛᴇʀꜱ", f"s:{key}:menu"),
-                button("📦 ɢᴇᴛ ᴘᴀɢᴇ", url=link(app, f"p_{key}_{page}")),
+                button(
+                    "📦 ɢᴇᴛ ᴘᴀɢᴇ", url=link(app, f"p_{key}_{page}"), style="success"
+                ),
             ],
         ]
     )
@@ -281,7 +296,7 @@ async def file_card(app, m, key, cfg):
     text = (
         head("🎞", "File details")
         + "\n\n<b>"
-        + escape(d["name"])
+        + escape(release(d["name"]))
         + "</b>\n"
         + escape(
             " · ".join(
@@ -291,14 +306,16 @@ async def file_card(app, m, key, cfg):
             )
         )
     )
+    text += "\n\n" + expiry_note(cfg)
     if meta:
         text += "\n\n" + meta["text"]
     markup = keys(
         [
             button("📥 ɢᴇᴛ ꜰɪʟᴇ", f"f:get:{key}", style="success"),
-            button("⭐ ꜱᴀᴠᴇ", f"f:save:{key}"),
+            button("⭐ ꜱᴀᴠᴇ", f"f:save:{key}", style="success"),
         ],
         rows,
+        file_links(cfg),
     )
     if meta and meta["poster"]:
         try:
@@ -314,51 +331,98 @@ async def file_card(app, m, key, cfg):
     )
 
 
-async def original(app, d):
+class MissingPost(ValueError):
+    pass
+
+
+async def read_post(app, d):
     # Recheck the original post. Deleted or newly protected media may still have a valid cached ID.
     source = await app.get_chat(d["source"])
     if source.has_protected_content:
         raise ValueError("This source now protects its content.")
     post = await app.get_messages(source.id, d["mid"], replies=0)
-    if (
-        not post
-        or post.empty
-        or not post.chat
-        or post.chat.id != source.id
-        or post.has_protected_content
-    ):
-        raise ValueError("The original file is unavailable.")
+    if not post or post.empty or not post.chat or post.chat.id != source.id:
+        raise MissingPost("The original file is unavailable.")
+    if post.has_protected_content:
+        raise ValueError("This post now protects its content.")
     media = next(
         (v for v in (post.document, post.video, post.audio, post.animation) if v), None
     )
-    if not media:
-        raise ValueError("The original post no longer contains a file.")
+    if not media or (d.get("unique") and media.file_unique_id != d["unique"]):
+        raise MissingPost("The original post no longer contains this file.")
     return post, media
 
 
+async def original(app, d, cfg):
+    absent = (MissingPost, MessageIdInvalid, ChannelPrivate, PeerIdInvalid)
+    try:
+        return await read_post(app, d)
+    except absent:
+        pass
+    # Reposts are delivery alternatives only while their source is enabled.
+    async for post in app.db.alternatives(d, cfg["sources"]):
+        try:
+            return await read_post(app, d | post)
+        except absent:
+            continue
+    raise MissingPost("This edition is unavailable in its active sources.")
+
+
+def file_links(cfg):
+    return [
+        button(label, url=cfg[key])
+        for key, label in (
+            ("updates_link", "📢 ᴜᴘᴅᴀᴛᴇꜱ"),
+            ("support_link", "💬 ꜱᴜᴘᴘᴏʀᴛ"),
+        )
+        if cfg[key]
+    ]
+
+
+def expiry_note(cfg):
+    return (
+        "⏱ This copy expires in 5 minutes. Reopen its file card if needed."
+        if cfg["protect_files"]
+        else "⏱ Forward to Saved Messages within 5 minutes to keep this file."
+    )
+
+
 async def deliver(app, uid, d, cfg):
-    _, media = await original(app, d)
+    _, media = await original(app, d, cfg)
     caption = cfg["caption"].format(
-        filename=d["name"],
-        title=d["name"],
+        filename=release(d["name"]),
+        title=release(d["name"]),
         size=size(d["bytes"]),
         quality=d["quality"] or "—",
         language=", ".join(d["language"]) or "—",
-    )[:1000]
+    )[:840]
+    first, sep, rest = caption.partition("\n")
     sent = await app.send_cached_media(
         uid,
         media.file_id,
-        caption=escape(caption),
+        caption="<b>"
+        + escape(first)
+        + "</b>"
+        + sep
+        + escape(rest)
+        + "\n\n"
+        + expiry_note(cfg),
+        reply_markup=keys(file_links(cfg)),
         protect_content=cfg["protect_files"],
     )
-    if cfg["auto_delete"]:
+    try:
         await app.db.deletions.insert_one(
             {
+                "_id": f"{uid}:{sent.id}",
                 "uid": uid,
                 "mid": sent.id,
-                "due": now() + timedelta(seconds=cfg["auto_delete"]),
+                "due": now() + timedelta(seconds=DELETE_AFTER),
             }
         )
+    except Exception:
+        # If scheduling fails, retract the temporary copy while we still know its ID.
+        await app.delete_messages(uid, sent.id)
+        raise
 
 
 async def file_action(app, q, verb, key, cfg):
@@ -368,7 +432,7 @@ async def file_action(app, q, verb, key, cfg):
     bookmark = {"_id": f"{uid}:{key}"}
     if verb == "remove":
         await app.db.saved.delete_one(bookmark)
-        return await show_saved(app, q.message, uid)
+        return await show_saved(app, q.message, uid, edit=True)
     if block := await gate(app, uid, cfg):
         return await q.message.reply_text(block[0], reply_markup=block[1])
     d = await entry(app, key, cfg)
@@ -386,12 +450,24 @@ async def file_action(app, q, verb, key, cfg):
             },
             upsert=True,
         )
-        return await q.message.reply_text(head("⭐", "Saved to watchlist"))
+        return await q.message.edit_reply_markup(
+            reply_markup=keys(
+                [
+                    button("📥 ɢᴇᴛ ꜰɪʟᴇ", f"f:get:{key}", style="success"),
+                    button("★ ꜱᴀᴠᴇᴅ", "nav:saved", style="success"),
+                ],
+                *[
+                    row
+                    for row in q.message.reply_markup.inline_keyboard[1:]
+                    if row and row[0].url
+                ],
+            )
+        )
     if verb == "get":
         await deliver(app, uid, d, cfg)
 
 
-async def show_saved(app, m, uid, page=0):
+async def show_saved(app, m, uid, page=0, *, edit=False):
     if m.chat.id != uid:
         raise ValueError("Open /saved in private.")
     cfg = await app.db.config()
@@ -406,8 +482,10 @@ async def show_saved(app, m, uid, page=0):
     )
     items = [
         [
-            button(r["name"][:64], url=link(app, "f_" + r["key"])),
-            button("✕", f"f:remove:{r['key']}"),
+            button(
+                release(r["name"])[:64], url=link(app, "f_" + r["key"]), style="success"
+            ),
+            button("✕", f"f:remove:{r['key']}", style="danger"),
         ]
         for r in rows[:8]
     ]
@@ -415,28 +493,31 @@ async def show_saved(app, m, uid, page=0):
     if page:
         nav.append(button("‹ ᴘʀᴇᴠ", f"nav:saved:{page - 1}"))
     if len(rows) > 8:
-        nav.append(button("ɴᴇxᴛ ›", f"nav:saved:{page + 1}"))
-    await m.reply_text(
+        nav.append(button("ɴᴇxᴛ ›", f"nav:saved:{page + 1}", style="success"))
+    text = (
         head("⭐", "My watchlist")
+        + "\n\n"
         + (
-            "\n\nTap a title to open its file card."
+            "Tap a title to open its file card."
             if rows
-            else "\n\nSave a file from its details card."
-        ),
-        reply_markup=keys(*items, nav, [button("✕ ᴄʟᴏꜱᴇ", "nav:close")]),
+            else "Save a file from its details card."
+        )
     )
+    markup = keys(*items, nav, [button("‹ ʜᴏᴍᴇ", "nav:home")])
+    if edit:
+        return await edit_panel(m, text, markup)
+    await m.reply_text(text, reply_markup=markup)
 
 
 async def send_page(app, m, key, page, cfg):
     uid = m.from_user.id
     s = await get_session(app, key, uid)
-    from plugins.settings import group_config
-
-    cfg = await group_config(app, s.get("chat", uid), cfg)
     if not allowed(s.get("chat", uid), cfg):
         raise ValueError("Search is disabled in the original chat.")
     if block := await gate(app, uid, cfg):
         return await m.reply_text(block[0], reply_markup=block[1])
+    if s.get("version") != 2:
+        await render(app, s, cfg, await app.db.config(uid), page, refresh=True)
     n = cfg["page_size"]
     hits = [r for r in s.get("hits", []) if r["source"] in cfg["sources"]]
     rows = hits[page * n : (page + 1) * n]
@@ -449,7 +530,9 @@ async def send_page(app, m, key, page, cfg):
         except ValueError:
             continue
         sent += 1
-    await m.reply_text(f"📦 Delivered {sent} of {len(rows)} files.")
+    await m.reply_text(
+        f"📦 Delivered {sent} of {len(rows)} files.", reply_markup=keys()
+    )
 
 
 async def inline(app, q, cfg):
@@ -469,13 +552,20 @@ async def inline(app, q, cfg):
             results.append(
                 types.InlineQueryResultArticle(
                     id=d["_id"],
-                    title=d["name"],
+                    title=release(d["name"]),
                     description=size(d["bytes"]),
                     input_message_content=types.InputTextMessageContent(
-                        head("🎞", "File details") + "\n" + escape(d["name"])
+                        head("🎞", "File details") + "\n" + escape(release(d["name"]))
                     ),
                     reply_markup=keys(
-                        [button("📥 ᴏᴘᴇɴ ꜰɪʟᴇ", url=link(app, "f_" + d["_id"]))]
+                        [
+                            button(
+                                "📥 ᴏᴘᴇɴ ꜰɪʟᴇ",
+                                url=link(app, "f_" + d["_id"]),
+                                style="success",
+                            )
+                        ],
+                        close=False,
                     ),
                 )
             )
