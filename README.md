@@ -24,7 +24,7 @@
 
 ## 🗝 𝐒𝐞𝐭𝐮𝐩
 
-Use Python 3.12 and MongoDB 5.0 or later. Give the database user read/write and index creation access on each named database. Allow the host’s IP through your MongoDB network rules.
+Use Python 3.11–3.14 and MongoDB 5.0 or later. Give the database user read/write and index creation access on each named database. Allow the host’s IP through your MongoDB network rules.
 
 | Required secret | Where it comes from |
 | --- | --- |
@@ -33,15 +33,37 @@ Use Python 3.12 and MongoDB 5.0 or later. Give the database user read/write and 
 | `OWNER_ID` | Your numeric Telegram user ID. This account controls global settings. |
 | `DATABASE_URI` | A MongoDB URI including the database name, e.g. `mongodb+srv://USER:PASSWORD@HOST/wovie`. Percent-encode reserved characters in credentials. |
 
+Clone once. If you already have the checkout, open its directory and continue with the next block.
+
 ```sh
 git clone https://github.com/WikioApps/WovieSearchBot.git
 cd WovieSearchBot
-cp .env.example .env
-# Fill in the five values in .env
-python3.12 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-python bot.py
+```
+
+On Ubuntu or Debian, install virtual environment support for the system Python. Run the package commands as root or with `sudo`.
+
+```sh
+deactivate 2>/dev/null || true
+apt-get update && apt-get install -y python3 python3-venv nano
+/usr/bin/python3 --version
+```
+
+If the version shown is 3.11–3.14, create the environment and install the dependencies. To use a separately installed Python, substitute its full path in the first command (for example, `/usr/bin/python3.14` with the Ubuntu package `python3.14-venv`).
+
+```sh
+/usr/bin/python3 -m venv .venv && \
+  .venv/bin/python -m pip install -r requirements.txt
+```
+
+After installation succeeds, fill in the five values and save the file. The first command preserves an existing `.env`.
+
+```sh
+test -e .env || cp .env.example .env
+nano .env
+```
+
+```sh
+.venv/bin/python bot.py
 ```
 
 Open the bot in private and send `/start`. Set your Updates, Support, Films and Guide URLs in **Bot Settings → Brand & links**. Empty links stay hidden. Your fork can also edit the defaults in [info.py](info.py) and the labels in [Script.py](Script.py). Telegram renders the Unicode small-cap labels, native buttons and bold captions on the user’s device.
