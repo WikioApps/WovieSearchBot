@@ -1,20 +1,20 @@
 """Private/group auto-filter, release facets, Telegram delivery and watchlist."""
 
+import asyncio
+import secrets
 from datetime import timedelta
 from html import escape
 from math import ceil
 
 from pyrogram import enums, types
 from pyrogram.errors import (
-    ChannelPrivate,
-    MessageIdInvalid,
-    PeerIdInvalid,
     RPCError,
     UserNotParticipant,
 )
 
 from database.ia_filterdb import now, preferred_filters
 from info import DELETE_AFTER, LANGUAGES, QUALITIES
+from plugins.file_store import INVALID_HANDLE, MissingPost, handles
 from Script import button, caps, edit_panel, head, keys, release, size
 
 FACETS = {
@@ -331,43 +331,6 @@ async def file_card(app, m, key, cfg):
     )
 
 
-class MissingPost(ValueError):
-    pass
-
-
-async def read_post(app, d):
-    # Recheck the original post. Deleted or newly protected media may still have a valid cached ID.
-    source = await app.get_chat(d["source"])
-    if source.has_protected_content:
-        raise ValueError("This source now protects its content.")
-    post = await app.get_messages(source.id, d["mid"], replies=0)
-    if not post or post.empty or not post.chat or post.chat.id != source.id:
-        raise MissingPost("The original file is unavailable.")
-    if post.has_protected_content:
-        raise ValueError("This post now protects its content.")
-    media = next(
-        (v for v in (post.document, post.video, post.audio, post.animation) if v), None
-    )
-    if not media or (d.get("unique") and media.file_unique_id != d["unique"]):
-        raise MissingPost("The original post no longer contains this file.")
-    return post, media
-
-
-async def original(app, d, cfg):
-    absent = (MissingPost, MessageIdInvalid, ChannelPrivate, PeerIdInvalid)
-    try:
-        return await read_post(app, d)
-    except absent:
-        pass
-    # Reposts are delivery alternatives only while their source is enabled.
-    async for post in app.db.alternatives(d, cfg["sources"]):
-        try:
-            return await read_post(app, d | post)
-        except absent:
-            continue
-    raise MissingPost("This edition is unavailable in its active sources.")
-
-
 def file_links(cfg):
     return [
         button(label, url=cfg[key])
@@ -388,7 +351,6 @@ def expiry_note(cfg):
 
 
 async def deliver(app, uid, d, cfg):
-    _, media = await original(app, d, cfg)
     caption = cfg["caption"].format(
         filename=release(d["name"]),
         title=release(d["name"]),
@@ -397,19 +359,28 @@ async def deliver(app, uid, d, cfg):
         language=", ".join(d["language"]) or "—",
     )[:840]
     first, sep, rest = caption.partition("\n")
-    sent = await app.send_cached_media(
-        uid,
-        media.file_id,
-        caption="<b>"
+    options = {
+        "caption": "<b>"
         + escape(first)
         + "</b>"
         + sep
         + escape(rest)
         + "\n\n"
         + expiry_note(cfg),
-        reply_markup=keys(file_links(cfg)),
-        protect_content=cfg["protect_files"],
-    )
+        "reply_markup": keys(file_links(cfg)),
+        "protect_content": cfg["protect_files"],
+    }
+    sent = None
+    async for handle in handles(app, d, cfg):
+        try:
+            sent = await app.send_cached_media(uid, handle, **options)
+        except INVALID_HANDLE:
+            continue
+        break
+    if sent is None:
+        raise ValueError(
+            "Telegram did not confirm delivery. Check your chat before trying again."
+        )
     try:
         await app.db.deletions.insert_one(
             {
@@ -533,6 +504,128 @@ async def send_page(app, m, key, page, cfg):
     await m.reply_text(
         f"📦 Delivered {sent} of {len(rows)} files.", reply_markup=keys()
     )
+
+
+async def share(app, m, cmd, arg, cfg):
+    from plugins.index import boundary
+
+    async def resolve(ref):
+        source, mid, _ = boundary(ref)
+        if isinstance(source, str):
+            source = (await app.get_chat(source)).id
+        if source not in cfg["sources"] or not 0 < mid < 2**31:
+            raise ValueError("Choose a post from an enabled catalog source.")
+        return source, mid
+
+    if cmd == "link":
+        post = m.reply_to_message
+        if arg:
+            source, mid = await resolve(arg)
+        elif (
+            post
+            and getattr(post.forward_origin, "chat", None)
+            and getattr(post.forward_origin, "message_id", None)
+        ):
+            source, mid = post.forward_origin.chat.id, post.forward_origin.message_id
+        elif post and m.chat.id < 0:
+            source, mid = m.chat.id, post.id
+        else:
+            raise ValueError(
+                "Use /link POST_LINK, /link CHAT_ID POST_ID, or reply to an indexed source post."
+            )
+        key = f"{abs(source):x}_{mid:x}"
+        await entry(app, key, cfg)
+        url = link(app, "f_" + key)
+    else:
+        parts = arg.split()
+        if len(parts) == 3 and all(p.isdecimal() for p in parts[1:]):
+            source, first = await resolve(" ".join(parts[:2]))
+            last = int(parts[2])
+        elif len(parts) == 2 and all(p.startswith("https://t.me/") for p in parts):
+            source, first = await resolve(parts[0])
+            other, last = await resolve(parts[1])
+            if source != other:
+                raise ValueError("Both posts must belong to the same source.")
+        else:
+            raise ValueError(
+                "Use /batch CHAT_ID FIRST_ID LAST_ID, or /batch FIRST_POST_LINK LAST_POST_LINK."
+            )
+        if not first <= last < min(first + 100, 2**31):
+            raise ValueError("Choose an ascending range of up to 100 source posts.")
+        keys_in_range = [f"{abs(source):x}_{mid:x}" for mid in range(first, last + 1)]
+        indexed = {}
+        for coll in app.db.shards.values():
+            async for row in coll.database.eva_posts.find(
+                {"_id": {"$in": keys_in_range}}, {"media": 1}
+            ):
+                indexed[row["_id"]] = row["media"]
+        items, seen = [], set()
+        for key in keys_in_range:
+            if key in indexed and indexed[key] not in seen:
+                items.append({"key": key, "media": indexed[key]})
+                seen.add(indexed[key])
+        if not items:
+            raise ValueError("This range has no indexed files.")
+        token = secrets.token_hex(12)
+        await app.db.db.eva_batches.insert_one({"_id": token, "items": items})
+        url = link(app, "b_" + token)
+    await m.reply_text(
+        url,
+        reply_markup=keys([button("📦 ᴏᴘᴇɴ", url=url, style="success")]),
+        link_preview_options=types.LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def shared_batch(app, m, uid, token, page, cfg, *, edit=False, send=False):
+    if m.chat.id != uid:
+        raise ValueError("Open the batch in your private chat.")
+    if block := await gate(app, uid, cfg):
+        return await m.reply_text(block[0], reply_markup=block[1])
+    batch = await app.db.db.eva_batches.find_one({"_id": token})
+    n = cfg["page_size"]
+    if not batch or not 0 <= page < ceil(len(batch["items"]) / n):
+        raise ValueError("This batch page is unavailable.")
+    items = batch["items"][page * n : (page + 1) * n]
+    docs = await asyncio.gather(*(app.db.file(item["key"]) for item in items))
+    rows = [
+        d
+        for d, item in zip(docs, items)
+        if d and d["source"] in cfg["sources"] and d["media"] == item["media"]
+    ]
+    if send:
+        count = 0
+        for row in rows:
+            try:
+                await deliver(app, uid, row, cfg)
+                count += 1
+            except MissingPost:
+                continue
+        return await m.reply_text(
+            f"📦 Delivered {count} of {len(items)} batch files.", reply_markup=keys()
+        )
+    pages = ceil(len(batch["items"]) / n)
+    nav = []
+    if page:
+        nav.append(button("‹ ᴘʀᴇᴠ", f"b:view:{token}:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(button("ɴᴇxᴛ ›", f"b:view:{token}:{page + 1}", style="success"))
+    markup = keys(
+        *[
+            [button(release(d["name"])[:64], url=link(app, "f_" + d["_id"]))]
+            for d in rows
+        ],
+        [button("📥 ɢᴇᴛ ᴘᴀɢᴇ", f"b:get:{token}:{page}", style="success")]
+        if rows
+        else [],
+        nav,
+    )
+    text = (
+        head("📦", "File batch")
+        + f"\nPage {page + 1} of {pages} · {len(rows)} available on this page."
+    )
+    if edit:
+        return await edit_panel(m, text, markup)
+    await m.reply_text(text, reply_markup=markup)
 
 
 async def inline(app, q, cfg):

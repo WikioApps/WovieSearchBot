@@ -68,10 +68,21 @@ def tags(text):
     }
 
 
+def attachment(m):
+    return next(
+        (
+            media
+            for field in ("document", "video", "audio", "animation")
+            if (media := getattr(m, field, None))
+        ),
+        None,
+    )
+
+
 def file_doc(m):
     if getattr(m, "has_protected_content", False) or getattr(m, "empty", False):
         return None
-    media = next((v for v in (m.document, m.video, m.audio, m.animation) if v), None)
+    media = attachment(m)
     if not media:
         return None
     caption = str(m.caption or "").splitlines()
@@ -91,6 +102,7 @@ def file_doc(m):
             "name": name[:230],
             "bytes": media.file_size or 0,
             "file": media.file_id,
+            "mime": getattr(media, "mime_type", None),
             "unique": media.file_unique_id,
             "time": m.date or now(),
             "tokens": tokens,
@@ -161,6 +173,7 @@ class Store:
         self.db = self.dbs[0]
         self.shards = {}
         self.catalog_lock = asyncio.Lock()
+        self.archive_lock = asyncio.Lock()
         self.state = self.db.eva_settings
         self.jobs = self.db.eva_jobs
         self.users = self.db.eva_users
@@ -302,6 +315,44 @@ class Store:
                     {"_id": "distinct-v1"}, {"$set": marker}, upsert=True
                 )
 
+            # distinct-v1 kept the old rows but omitted their delivery handles.
+            # Patch existing editions only. Deleted catalog entries must stay deleted.
+            marker_id = {"_id": "delivery-handles-v1"}
+            marker = await db.eva_meta.find_one(marker_id) or {}
+            while not marker.get("complete"):
+                rows = await (
+                    db.eva_files.find(
+                        {
+                            "_id": {"$gt": marker.get("cursor", "")},
+                            "file": {"$type": "string", "$ne": ""},
+                        },
+                        {"unique": 1, "file": 1, "mime": 1},
+                    )
+                    .sort("_id", 1)
+                    .limit(100)
+                    .to_list(100)
+                )
+                handles = {r.get("unique") or "post:" + r["_id"]: r for r in rows}
+                writes = {}
+                async for route in self.db.eva_media_routes.find(
+                    {"_id": {"$in": list(handles)}}
+                ):
+                    row = handles[route["_id"]]
+                    writes.setdefault(route["shard"], []).append(
+                        UpdateOne(
+                            {"_id": route["_id"], "file": {"$in": [None, ""]}},
+                            {
+                                "$set": {
+                                    k: row[k] for k in ("file", "mime") if row.get(k)
+                                }
+                            },
+                        )
+                    )
+                for shard, ops in writes.items():
+                    await self.shards[shard].bulk_write(ops, ordered=False)
+                marker = {"cursor": rows[-1]["_id"]} if rows else {"complete": True}
+                await db.eva_meta.update_one(marker_id, {"$set": marker}, upsert=True)
+
     async def recover_writes(self):
         async for pending in self.db.eva_writes.find().sort("_id", 1):
             await self._apply(pending)
@@ -386,10 +437,13 @@ class Store:
                 for ident, rows in local.items():
                     first = rows[0]
                     fields = edition_fields(first)
+                    handle = next((d for d in reversed(rows) if d.get("file")), {})
+                    delivery = {k: handle[k] for k in ("file", "mime") if handle.get(k)}
                     items.append(
                         UpdateOne(
                             {"_id": ident},
                             {
+                                **({"$set": delivery} if delivery else {}),
                                 "$setOnInsert": dict(
                                     fields, ingest=op["stamp"], origin=first["_id"]
                                 ),
@@ -443,6 +497,20 @@ class Store:
                 if media:
                     return media | post
         return None
+
+    async def collection_for(self, identity):
+        route = await self.db.eva_media_routes.find_one({"_id": identity})
+        return self.shards[route["shard"]] if route else None
+
+    async def remember_handle(self, identity, file_id, mime=None, **fields):
+        coll = await self.collection_for(identity)
+        if coll is None:
+            return False
+        fields["file"] = file_id
+        if mime:
+            fields["mime"] = mime
+        result = await coll.update_one({"_id": identity}, {"$set": fields})
+        return bool(result.matched_count)
 
     async def alternatives(self, doc, sources):
         ident = doc["media"]

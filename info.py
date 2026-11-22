@@ -27,6 +27,7 @@ DEFAULTS = {
     "admins": [],
     "force_sub": [],
     "requests_chat": 0,
+    "archive_chat": 0,
     "updates_chat": 0,
     "pm_search": True,
     "group_search": True,
@@ -60,6 +61,7 @@ SECTIONS = {
         "admins",
         "force_sub",
         "requests_chat",
+        "archive_chat",
         "updates_chat",
     ),
     "Search & delivery": (
@@ -110,6 +112,7 @@ DESCRIPTIONS = {
     "batch_size": "Message IDs per indexing request, 1–100.",
     "page_size": "File rows per page, 3–10.",
     "updates_chat": "Destination for announcements of new live media. 0 turns this off.",
+    "archive_chat": "Optional private storage channel ID. The bot keeps one copy per edition to refresh expired file IDs after leaving a source. Set before indexing, or repeat a range to archive it. 0 disables new copies.",
     "requests_chat": "Destination for title requests. 0 sends them to the owner.",
 }
 

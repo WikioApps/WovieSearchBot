@@ -3,6 +3,7 @@
 from html import escape
 
 from info import CHOICES, DEFAULTS, DESCRIPTIONS, PERSONAL, SECTIONS, parse_setting
+from plugins.file_store import archive_channel
 from Script import button, caps, edit_panel, head, keys
 
 LABELS = {
@@ -10,6 +11,7 @@ LABELS = {
     "pm_search": "Private search",
     "layout": "Result layout",
     "requests_chat": "Request inbox",
+    "archive_chat": "Private storage channel",
     "updates_chat": "Announcement channel",
     "sources": "Media sources",
     "search_groups": "Allowed groups",
@@ -148,6 +150,8 @@ async def callback(app, q, parts):
         if verb == "reset":
             await app.db.setting(key, None, target, reset=True)
         else:
+            if key not in CHOICES and type(defaults[key]) is not bool:
+                raise ValueError("Use Edit to enter this setting.")
             await app.db.setting(key, parse_setting(key, args[1], personal), target)
         verb = "key"
     text, markup = await panel(app, uid, scope, verb, key)
@@ -162,6 +166,15 @@ async def input_value(app, m, prompt):
     if raw is None:
         raise ValueError("Send a text value or /cancel.")
     value = parse_setting(key, raw, scope == "u")
+    if key == "archive_chat" and value:
+        from plugins.index import remember
+
+        chat = await archive_channel(app, value, await app.db.config())
+        await remember(app, chat)
+    if key == "sources" and (await app.db.config()).get("archive_chat") in value:
+        raise ValueError(
+            "Keep the private storage channel outside the searchable sources."
+        )
     if key == "tmdb_key":
         from pyrogram.errors import RPCError
 

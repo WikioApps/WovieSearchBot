@@ -23,6 +23,9 @@ log = logging.getLogger("wovie")
 OPERATIONS = {
     "index",
     "sindex",
+    "repair",
+    "link",
+    "batch",
     "jobs",
     "status",
     "stats",
@@ -146,6 +149,8 @@ async def handle(app, m):
         if cmd == "start":
             if chat > 0 and arg.startswith("f_"):
                 return await search.file_card(app, m, arg[2:], cfg)
+            if chat > 0 and (match := re.fullmatch(r"b_([a-f0-9]{24})", arg)):
+                return await search.shared_batch(app, m, uid, match[1], 0, cfg)
             if chat > 0 and (match := re.fullmatch(r"p_([a-f0-9]{12})_(\d{1,2})", arg)):
                 return await search.send_page(app, m, match[1], int(match[2]), cfg)
             if arg == "help":
@@ -194,6 +199,10 @@ async def handle(app, m):
                 raise ValueError("Catalog admin access required.")
             if cmd in {"index", "sindex"}:
                 return await index.propose(app, m, arg, session=cmd == "sindex")
+            if cmd == "repair":
+                return await index.repair(app, m, cfg)
+            if cmd in {"link", "batch"}:
+                return await search.share(app, m, cmd, arg, cfg)
             if cmd == "status":
                 return await index.watch(app, m, uid)
             if cmd == "jobs":
@@ -210,6 +219,8 @@ async def handle(app, m):
         pending = await app.db.user_prompt(uid)
         if pending and pending["kind"] == "setting":
             return await settings.input_value(app, m, pending)
+        if operator and pending and pending["kind"] == "repair":
+            return await index.repair(app, m, cfg, incoming=m)
         if operator and (m.forward_origin or (pending and pending["kind"] == "index")):
             return await index.propose(
                 app,
@@ -246,6 +257,17 @@ async def callback(app, q):
         return await index.watch(app, q.message, uid, edit=True)
     if family == "s":
         return await search.search_action(app, q, parts, cfg)
+    if family == "b" and len(parts) == 3 and verb in {"view", "get"}:
+        return await search.shared_batch(
+            app,
+            q.message,
+            uid,
+            parts[1],
+            int(parts[2]),
+            cfg,
+            edit=True,
+            send=verb == "get",
+        )
     if family == "f":
         return await search.file_action(app, q, *parts, cfg)
     if family == "idx":

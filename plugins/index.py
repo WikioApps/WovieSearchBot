@@ -12,8 +12,9 @@ from html import escape
 from pyrogram import enums
 from pyrogram.errors import FloodWait, MessageIdInvalid, MessageNotModified, RPCError
 
-from database.ia_filterdb import file_doc, now
+from database.ia_filterdb import attachment, file_doc, now
 from plugins.commands import audit
+from plugins.file_store import archive
 from Script import button, duration, head, keys, release
 
 log = logging.getLogger(__name__)
@@ -103,6 +104,10 @@ async def propose(app, m, text="", session=False):
         raise ValueError("The last message ID must exceed the skipped ID.")
     try:
         chat = await source_chat(app, source)
+        if chat.id == (await app.db.config()).get("archive_chat"):
+            raise ValueError(
+                "The private storage channel cannot be indexed as a source."
+            )
         msg = await app.get_messages(chat.id, last, replies=0)
     except FloodWait:
         raise
@@ -167,6 +172,8 @@ def progress(j):
         elif rate:
             line += f"\n{rate:.1f} posts/s · ETA {duration((total - done) / rate)}"
     line += f"\nNew {j.get('added', 0):,} · Repeats {j.get('repeats', 0):,} · Media posts {j['indexed']:,}"
+    if j.get("unavailable"):
+        line += f"\nSkipped (unavailable to bot) {j['unavailable']:,}"
     return "<b>" + escape(j.get("title") or str(j["source"])) + "</b>\n" + line
 
 
@@ -347,7 +354,7 @@ async def notify(app, j, cfg):
 
 
 async def batch(app, j, cfg):
-    if j["source"] not in cfg["sources"]:
+    if j["source"] == cfg.get("archive_chat") or j["source"] not in cfg["sources"]:
         raise ValueError("Source removed from bot settings.")
     if j["actor"] != app.owner and j["actor"] not in cfg["admins"]:
         raise ValueError("Index operator access was removed.")
@@ -377,7 +384,23 @@ async def batch(app, j, cfg):
         for m in messages
         if m and not m.empty and m.chat and m.chat.id == chat.id and (d := file_doc(m))
     ]
+    candidates = len(docs)
+    if reader is not app and docs:
+        # A user session and a bot receive different access hashes for the same media.
+        # Session history selects posts. Only the bot's view supplies deliverable IDs.
+        bot_posts = await app.get_messages(chat.id, [d["mid"] for d in docs], replies=0)
+        fresh = {
+            m.id: file_doc(m)
+            for m in bot_posts
+            if m and m.chat and m.chat.id == chat.id and not m.empty
+        }
+        docs = [
+            fresh[d["mid"]]
+            for d in docs
+            if fresh.get(d["mid"]) and fresh[d["mid"]]["unique"] == d["unique"]
+        ]
     added = await app.db.catalog_write(docs, stamp=f"{j['_id']}:{j['cursor']}")
+    await archive(app, docs, cfg)
     state = "complete" if end == j["last"] else "running"
     rate = (end - j["cursor"]) / (
         max(0.001, asyncio.get_running_loop().time() - tick) + 0.6
@@ -403,6 +426,7 @@ async def batch(app, j, cfg):
             "$set": fields,
             "$inc": {
                 "indexed": len(docs),
+                "unavailable": candidates - len(docs),
                 "added": added,
                 "repeats": len(docs) - added,
             },
@@ -458,7 +482,11 @@ async def worker(app):
 
 
 async def live(app, m, cfg, *, edited=False):
-    if m.chat.id not in cfg["sources"] or m.chat.has_protected_content:
+    if (
+        m.chat.id == cfg.get("archive_chat")
+        or m.chat.id not in cfg["sources"]
+        or m.chat.has_protected_content
+    ):
         return
     d = file_doc(m)
     if not d:
@@ -467,6 +495,14 @@ async def live(app, m, cfg, *, edited=False):
         return
     await remember(app, m.chat)
     created = await app.db.catalog_write([d])
+    try:
+        await archive(app, [d], cfg)
+    except (RPCError, ValueError) as exc:
+        # Keep the live catalog entry. An operator can repeat this range to fill
+        # the archive after restoring the channel or waiting out a rate limit.
+        log.warning(
+            "Archive deferred for %s/%s (%s)", m.chat.id, m.id, type(exc).__name__
+        )
     if created and cfg["updates_chat"] and cfg["updates_chat"] != m.chat.id:
         await app.send_message(
             cfg["updates_chat"],
@@ -492,3 +528,53 @@ async def remove_posts(app, messages, cfg):
         await app.db.catalog_write(
             removed=[key for ids in sources.values() for key in ids]
         )
+
+
+async def repair(app, m, cfg, incoming=None):
+    if m.chat.id != m.from_user.id:
+        raise ValueError("Use /repair in your private chat with the bot.")
+    msg = incoming or m.reply_to_message
+    if not msg:
+        panel = await m.reply_text(
+            "Forward or upload the matching file here. Use /cancel to leave.",
+            reply_markup=keys(),
+        )
+        await app.db.prompt(m.from_user.id, "repair", panel=panel.id)
+        return
+    if msg.has_protected_content or msg.chat.has_protected_content:
+        raise ValueError("Choose a file with content sharing enabled.")
+    media = attachment(msg)
+    if not media or not media.file_unique_id:
+        raise ValueError("Send the matching document, video, audio or animation.")
+    coll = await app.db.collection_for(media.file_unique_id)
+    post = (
+        None
+        if coll is None
+        else await coll.database.eva_posts.find_one(
+            {"media": media.file_unique_id, "source": {"$in": cfg["sources"]}},
+            {"_id": 1},
+        )
+    )
+    if not post or not await app.db.remember_handle(
+        media.file_unique_id, media.file_id, media.mime_type
+    ):
+        raise ValueError("This file has no exact match in the active catalog.")
+    await archive(
+        app,
+        [{"unique": media.file_unique_id, "file": media.file_id}],
+        cfg,
+        verify_existing=True,
+    )
+    await app.db.prompts.delete_one({"_id": m.from_user.id, "kind": "repair"})
+    await m.reply_text(
+        head("✓", "File restored") + "\nThe existing file card is ready.",
+        reply_markup=keys(
+            [
+                button(
+                    "📥 ᴠɪᴇᴡ ꜰɪʟᴇ",
+                    url=f"https://t.me/{app.me.username}?start=f_{post['_id']}",
+                    style="success",
+                )
+            ]
+        ),
+    )

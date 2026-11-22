@@ -142,6 +142,24 @@ async def stats(app, m, cfg, *, edit=False):
                         "$group": {
                             "_id": None,
                             "files": {"$sum": 1},
+                            "handles": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$ne": [{"$ifNull": ["$file", ""]}, ""]},
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
+                            "archived": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$ifNull": ["$archive.mid", False]},
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
                             "bytes": {"$sum": "$bytes"},
                         }
                     }
@@ -166,9 +184,17 @@ async def stats(app, m, cfg, *, edit=False):
         except OperationFailure:
             disk = None
         return (
-            (data[0]["files"], data[0]["bytes"], posts, disk, available)
+            (
+                data[0]["files"],
+                data[0]["bytes"],
+                posts,
+                disk,
+                available,
+                data[0]["handles"],
+                data[0]["archived"],
+            )
             if data
-            else (0, 0, posts, disk, available)
+            else (0, 0, posts, disk, available, 0, 0)
         )
 
     catalogs = await asyncio.gather(*(catalog(c) for c in app.db.shards.values()))
@@ -176,6 +202,8 @@ async def stats(app, m, cfg, *, edit=False):
     total_bytes = sum(r[1] for r in catalogs)
     posts = sum(r[2] for r in catalogs)
     available = sum(r[4] for r in catalogs)
+    handles = sum(r[5] for r in catalogs)
+    archived = sum(r[6] for r in catalogs)
     sizes = [r[3] for r in catalogs]
     disk = size(sum(sizes)) if None not in sizes else "Unavailable"
     users = app.db.users
@@ -197,7 +225,8 @@ async def stats(app, m, cfg, *, edit=False):
     text = (
         head("🎬", "Library dashboard") + f"\n<i>{now():%d %b %Y · %H:%M UTC}</i>\n\n"
         f"<b>ᴄᴀᴛᴀʟᴏɢ</b>\nUnique files  <b>{files:,}</b>   ·   Media  <b>{size(total_bytes)}</b>\n"
-        f"Indexed posts  {posts:,}   ·   Extra copies  {max(0, posts - files):,}\nSearchable files  {available:,}   ·   Active sources  {len(cfg['sources']):,}\n\n"
+        f"Indexed posts  {posts:,}   ·   Extra copies  {max(0, posts - files):,}\nSearchable files  {available:,}   ·   Active sources  {len(cfg['sources']):,}\n"
+        f"Saved file IDs  {handles:,}   ·   Missing IDs  {files - handles:,}   ·   Archived  {archived:,}\n\n"
         f"<b>ᴀᴜᴅɪᴇɴᴄᴇ</b>\nTotal users  <b>{people:,}</b>   ·   Active in 30 days  <b>{active:,}</b>\n"
         f"Private chats  {private:,}   ·   Groups  {groups:,}\nBlocked the bot  {blocked:,}   ·   Admin bans  {banned:,}\n\n"
         f"<b>ꜱᴛᴏʀᴀɢᴇ & ᴏᴘᴇʀᴀᴛɪᴏɴꜱ</b>\nMongoDB data + indexes  {disk}   ·   Databases  {len(sizes)}\n"

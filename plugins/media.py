@@ -1,8 +1,10 @@
 """Optional TMDB cards and bounded, expiring HTTP media streams."""
 
 import logging
+import mimetypes
 import re
 import secrets
+from contextlib import aclosing
 from datetime import timedelta
 from html import escape
 from urllib.parse import quote
@@ -12,6 +14,7 @@ from aiohttp import web
 from pyrogram.errors import RPCError
 
 from database.ia_filterdb import norm, now
+from plugins.file_store import INVALID_HANDLE, MissingPost, handles
 from Script import button
 
 log = logging.getLogger(__name__)
@@ -100,8 +103,33 @@ def byte_range(value, total):
     return start, end
 
 
+async def stream_range(app, d, cfg, first, last):
+    # Refresh before sending headers. On a later failure resume at the first
+    # undelivered byte, including when a client requested part of a chunk.
+    cursor = first
+    async for handle in handles(app, d, cfg):
+        pos = cursor // CHUNK * CHUNK
+        try:
+            async with aclosing(
+                app.stream_media(
+                    handle, offset=pos // CHUNK, limit=last // CHUNK - pos // CHUNK + 1
+                )
+            ) as blocks:
+                async for block in blocks:
+                    part = block[cursor - pos : last - pos + 1]
+                    if not part:
+                        break
+                    cursor += len(part)
+                    yield part
+                    if cursor > last:
+                        return
+                    pos += len(block)
+        except INVALID_HANDLE:
+            continue
+
+
 async def serve(app, req):
-    from plugins.pm_filter import entry, missing_membership, original
+    from plugins.pm_filter import entry, missing_membership
 
     key = req.match_info["token"]
     grant = await app.db.db.eva_grants.find_one({"_id": key, "expires": {"$gt": now()}})
@@ -125,10 +153,9 @@ async def serve(app, req):
             if await missing_membership(app, grant["uid"], cfg):
                 raise web.HTTPForbidden()
             d = await entry(app, grant["file"], cfg)
-            post, media = await original(app, d, cfg)
         except (ValueError, RPCError):
             raise web.HTTPNotFound() from None
-        total = media.file_size or 0
+        total = d["bytes"]
         try:
             first, last = byte_range(req.headers.get("Range"), total)
         except ValueError:
@@ -136,7 +163,7 @@ async def serve(app, req):
                 headers={"Content-Range": f"bytes */{total}"}
             ) from None
         partial = "Range" in req.headers
-        mime = media.mime_type or ""
+        mime = d.get("mime") or mimetypes.guess_type(d["name"])[0] or ""
         safe_mime = (
             mime
             if re.fullmatch(r"(?:video|audio)/[a-zA-Z0-9.+-]+", mime)
@@ -159,15 +186,20 @@ async def serve(app, req):
         if partial:
             headers["Content-Range"] = f"bytes {first}-{last}/{total}"
         response = web.StreamResponse(status=206 if partial else 200, headers=headers)
-        await response.prepare(req)
-        if req.method != "HEAD" and total:
-            pos = first // CHUNK * CHUNK
-            async for block in app.stream_media(
-                post, offset=first // CHUNK, limit=last // CHUNK - first // CHUNK + 1
-            ):
-                await response.write(block[max(0, first - pos) : last - pos + 1])
-                pos += len(block)
-                if pos > last:
-                    break
+        if req.method == "HEAD" or not total:
+            return response
+        async with aclosing(stream_range(app, d, cfg, first, last)) as blocks:
+            try:
+                first_block = await anext(blocks)
+            except MissingPost:
+                raise web.HTTPNotFound() from None
+            except RPCError:
+                raise web.HTTPServiceUnavailable(
+                    headers={"Retry-After": "10"}
+                ) from None
+            await response.prepare(req)
+            await response.write(first_block)
+            async for block in blocks:
+                await response.write(block)
         await response.write_eof()
         return response
